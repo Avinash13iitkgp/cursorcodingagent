@@ -11,7 +11,15 @@ import pytest
 from agent_engine.adapters.exec.jail import Jail
 from agent_engine.adapters.sqlite.db import open_tenant_db
 from agent_engine.adapters.verifier.external import ExternalVerifier
+from agent_engine.adapters.sqlite.trajectory_store import TrajectoryStore
 from agent_engine.adapters.workspace.plain import PlainWorkspace
+from agent_engine.application.context import (
+    ContextBuilder,
+    list_files,
+    outcome_line,
+    remember_note,
+    search_text,
+)
 from agent_engine.application.react import idempotency_key
 from agent_engine.domain.models import ToolCall
 from tests.step4_support import (
@@ -356,6 +364,115 @@ def test_unknown_tool_is_committed_as_an_error(tmp_path: Path) -> None:
         row = env.connection.execute("SELECT status, result_json FROM step_intents").fetchone()
         assert row["status"] == "committed"
         assert json.loads(row["result_json"])["error"] == "unknown tool"
+    finally:
+        env.connection.close()
+
+
+def test_context_pack_shrinks_searches_and_redacts(tmp_path: Path) -> None:
+    """Step 4 still executes the context packer, search, and remember."""
+    env = lease_task(tmp_path, "context-demo", broken=False)
+    try:
+        work = env.work
+        (work / "adder.py").write_text("return a - b\n" * 20, encoding="utf-8")
+        (work / "scratch.tmp").write_text("skip\n", encoding="utf-8")
+        (work / "linked").symlink_to(work / "adder.py")
+        workspace = PlainWorkspace(work)
+        capped = json.loads(search_text(workspace, "return", "adder.py"))
+        assert len(capped["hits"]) == 20
+        assert search_text(workspace, "return", "missing-dir") == '{"hits": []}'
+        listed = json.loads(list_files(workspace))
+        assert "adder.py" in listed["paths"]
+        assert "scratch.tmp" not in listed["paths"]
+        for escaped in ("../secret.txt", "/etc/passwd", ""):
+            with pytest.raises(ValueError):
+                search_text(workspace, "return", escaped)
+        secret = "super-secret-token"
+        note = remember_note(workspace, "adder.py", secret, f"note {secret}", 0, secret)
+        assert note[1] == "[redacted]"
+        assert outcome_line(
+            {"tool": "replace_text", "result": {"error": "StaleContent", "sha256": "abc"}}
+        ) == "replace_text StaleContent abc"
+        assert outcome_line(
+            {"tool": "run_checks", "result": {"ok": False, "sha256": "abc"}}
+        ) == "run_checks exit 1 abc"
+        assert outcome_line({"tool": "read_file", "sha256": "abc"}) == "read_file ok abc"
+        store = TrajectoryStore(env.connection, WORKER, env.token, lambda: NOW)
+        env.connection.execute("BEGIN IMMEDIATE")
+        env.connection.execute(
+            """
+            INSERT INTO trajectory (tenant_id, task_id, seq, step_index, kind, body_json)
+            VALUES (?, ?, 0, 0, 'tool_result', ?)
+            """,
+            (
+                env.tenant.value,
+                env.task_id,
+                json.dumps({"tool": "search_text", "result": {"text": "HUGE-TOOL-BODY" * 80}}),
+            ),
+        )
+        env.connection.execute(
+            """
+            INSERT INTO trajectory (tenant_id, task_id, seq, step_index, kind, body_json)
+            VALUES (?, ?, 1, 1, 'tool_result', ?)
+            """,
+            (
+                env.tenant.value,
+                env.task_id,
+                json.dumps({"tool": "read_file", "result": {"status": "short"}}),
+            ),
+        )
+        env.connection.execute("COMMIT")
+        shrunk = ContextBuilder(store, budget=200).pack(env.tenant, env.task_id)
+        assert "search_text ok" in json.dumps(shrunk)
+        assert "HUGE-TOOL-BODY" not in json.dumps(shrunk)
+        seen: list[str] = []
+
+        def summarize(messages: list[dict[str, object]]) -> str:
+            seen.append(json.dumps(messages))
+            return "compressed the middle"
+
+        packed = ContextBuilder(store, budget=40, summarize=summarize, secret=secret).pack(
+            env.tenant, env.task_id
+        )
+        assert seen
+        assert "HUGE-TOOL-BODY" not in seen[0]
+        assert "compressed the middle" in json.dumps(packed)
+        history = [
+            {"role": "user", "content": "short"},
+            {"role": "user", "content": "x" * 200},
+            {"role": "user", "content": "StaleContent " + ("y" * 200)},
+        ]
+        plain = ContextBuilder(budget=1).pack(env.tenant, env.task_id, history)
+        assert "tool ok" in json.dumps(plain)
+        assert "tool StaleContent" in json.dumps(plain)
+        llm = ScriptedLlm(
+            [
+                (call("list_files", {"path": "."}),),
+                (call("search_text", {"query": "return", "path": ".."}),),
+                (
+                    call(
+                        "remember",
+                        {"path": "adder.py", "quote": secret, "note": secret},
+                    ),
+                ),
+                (),
+            ]
+        )
+        result = loop(
+            env,
+            llm,
+            StatusGate(env, None),
+            FixedChecks(),
+            context=ContextBuilder(store, secret=secret),
+            secret=secret,
+        ).run(NOW)
+        assert result.status == "running"
+        assert secret not in "\n".join(
+            str(row[0])
+            for row in env.connection.execute(
+                "SELECT body FROM knowledge WHERE task_id = ?",
+                (env.task_id,),
+            ).fetchall()
+        )
     finally:
         env.connection.close()
 

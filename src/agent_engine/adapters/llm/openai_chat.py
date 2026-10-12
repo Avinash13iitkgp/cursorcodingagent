@@ -62,6 +62,48 @@ _TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List relative paths under the work root.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_text",
+            "description": "Find a literal substring under the work root.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "path": {"type": "string"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": "Store one knowledge note. It does not write the file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "quote": {"type": "string"},
+                    "note": {"type": "string"},
+                },
+                "required": ["path", "quote", "note"],
+            },
+        },
+    },
 ]
 
 
@@ -251,6 +293,34 @@ class OpenAIChatLlm:
         self._log(headers, body)
         raw = self._transport.post(self._url, headers, body, self._timeout_s)
         return _parse_calls(raw)
+
+    def summarize(self, messages: list[dict[str, object]]) -> str:
+        """POST one tool-free completion and return the assistant text.
+
+        Args:
+            messages: Prompt to compress. The bearer token is redacted in the log.
+
+        Returns:
+            The assistant content. An empty content is an empty string.
+
+        Raises:
+            ValueError: The body is not a chat completion with a message.
+        """
+        self._posts += 1
+        payload: dict[str, object] = {"model": self._model, "messages": messages}
+        body = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        self._log(headers, body)
+        raw = self._transport.post(self._url, headers, body, self._timeout_s)
+        try:
+            message = json.loads(raw)["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("chat completion is missing a message") from exc
+        content = message.get("content")
+        return "" if content is None else str(content)
 
     def _log(self, headers: dict[str, str], body: bytes) -> None:
         redacted = dict(headers)

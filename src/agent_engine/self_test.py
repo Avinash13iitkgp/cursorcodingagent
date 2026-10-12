@@ -62,12 +62,12 @@ def run_self_test(
         print("self-test requires --step or --through", file=sys.stderr)
         return 1
     if through is not None:
-        if through < 1 or through > 6 or (step is not None and (step < 1 or step > through)):
+        if through < 1 or through > 7 or (step is not None and (step < 1 or step > through)):
             print("FAIL")
             print(f"step {through} is not implemented", file=sys.stderr)
             return 1
         steps = range(1, through + 1)
-    elif step not in (1, 2, 3, 4, 5, 6):
+    elif step not in (1, 2, 3, 4, 5, 6, 7):
         print("FAIL")
         print(f"step {step} is not implemented", file=sys.stderr)
         return 1
@@ -85,8 +85,10 @@ def run_self_test(
                 _run_step4(data_root, live=live and through is None)
             elif number == 5:
                 _run_step5(data_root, live=live and through is None)
-            else:
+            elif number == 6:
                 _run_step6(data_root)
+            else:
+                _run_step7(data_root)
     except (
         UnknownTenant,
         TenantMismatch,
@@ -368,6 +370,78 @@ def _check_echo(data_root: Path, report, secret: str | None) -> None:
         raise OSError("acme mcp call wrote globex")
 
 
+def _run_step7(data_root: Path) -> None:
+    """Run canned search and remember, then a forced summary.
+
+    Args:
+        data_root: Directory that contains tenants/.
+
+    The task id is context-demo. fix-adder is already completed when this
+    procedure follows step 4 on the same root.
+    """
+    _prepare_tenant(data_root, "acme")
+    _prepare_tenant(data_root, "globex")
+    init_task(data_root, TenantId("acme"), "context-demo")
+    task_dir = data_root / "tenants" / "acme" / "tasks" / "context-demo"
+    base = task_dir / "base"
+    base.mkdir(parents=True, exist_ok=True)
+    fixture = Path(__file__).resolve().parents[2] / "fixtures" / "broken_adder" / "adder.py"
+    if not (base / "adder.py").exists():
+        shutil.copyfile(fixture, base / "adder.py")
+    (base / "helper.py").write_text("marker-from-helper\n", encoding="utf-8")
+    from agent_engine.adapters.workspace.cow import CowWorkspace
+
+    CowWorkspace(task_dir).seed()
+    saved = os.environ.get("AGENT_LLM_API_KEY")
+    os.environ["AGENT_LLM_API_KEY"] = "context-step7-sentinel"
+    try:
+        first = run_task(
+            data_root,
+            TenantId("acme"),
+            "context-demo",
+            llm="canned",
+            tool_choice="context",
+        )
+        print(format_report(first))
+        if "remembered-helper" not in first.detail:
+            raise OSError("the next packed request omitted the remembered note")
+        if first.status in ("completed", "rejected"):
+            raise OSError(f"search run set tasks.status to {first.status}")
+        if _table_count(data_root, "globex", "knowledge") != 0:
+            raise OSError("acme knowledge was written to globex")
+        if _table_count(data_root, "globex", "trajectory") != 0:
+            raise OSError("acme trajectory was written to globex")
+        second = run_task(
+            data_root,
+            TenantId("acme"),
+            "context-demo",
+            llm="canned",
+            tool_choice="budget",
+            context_token_budget=40,
+        )
+    finally:
+        if saved is None:
+            os.environ.pop("AGENT_LLM_API_KEY", None)
+        else:
+            os.environ["AGENT_LLM_API_KEY"] = saved
+    print(format_report(second))
+    if second.status in ("completed", "rejected"):
+        raise OSError(f"summary set tasks.status to {second.status}")
+    if "search_text ok" not in second.detail:
+        raise OSError("older tool result was not the outcome line")
+    if "context-step7-sentinel" in second.detail or "context-step7-sentinel" in first.detail:
+        raise OSError("echo result contains AGENT_LLM_API_KEY")
+    kinds, bodies = _trajectory_dump(data_root, "acme", "context-demo")
+    if not {"model_inference", "tool_call", "tool_result", "context_summary"} <= kinds:
+        raise OSError(f"trajectory kinds are {sorted(kinds)}")
+    if not any("hits" in body for body in bodies):
+        raise OSError("full search result is missing from trajectory")
+    if any("context-step7-sentinel" in body for body in bodies):
+        raise OSError("bearer token is in a trajectory body")
+    if _note_has_secret(data_root, "acme", "context-demo", "context-step7-sentinel"):
+        raise OSError("bearer token is in a knowledge note")
+
+
 def _prepare_tenant(data_root: Path, tenant: str) -> None:
     provision(data_root, TenantId(tenant), tenant.capitalize())
 
@@ -404,12 +478,46 @@ def _step_count(data_root: Path, tenant: str) -> int:
 
 
 def _message_count(data_root: Path, tenant: str) -> int:
+    return _table_count(data_root, tenant, "messages")
+
+
+def _table_count(data_root: Path, tenant: str, table: str) -> int:
     connection = open_tenant_db(data_root, TenantId(tenant), read_only=True)
     try:
-        row = connection.execute("SELECT COUNT(*) AS n FROM messages").fetchone()
+        row = connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
     finally:
         connection.close()
     return int(row["n"])
+
+
+def _trajectory_dump(data_root: Path, tenant: str, task_id: str) -> tuple[set[str], list[str]]:
+    connection = open_tenant_db(data_root, TenantId(tenant), read_only=True)
+    try:
+        rows = connection.execute(
+            """
+            SELECT kind, body_json FROM trajectory
+            WHERE tenant_id = ? AND task_id = ?
+            """,
+            (tenant, task_id),
+        ).fetchall()
+    finally:
+        connection.close()
+    return {str(row["kind"]) for row in rows}, [str(row["body_json"]) for row in rows]
+
+
+def _note_has_secret(data_root: Path, tenant: str, task_id: str, secret: str) -> bool:
+    connection = open_tenant_db(data_root, TenantId(tenant), read_only=True)
+    try:
+        rows = connection.execute(
+            """
+            SELECT path, quote, body FROM knowledge
+            WHERE tenant_id = ? AND task_id = ?
+            """,
+            (tenant, task_id),
+        ).fetchall()
+    finally:
+        connection.close()
+    return any(secret in f"{row['path']}{row['quote']}{row['body']}" for row in rows)
 
 
 def _wait_dead(pid: int) -> None:

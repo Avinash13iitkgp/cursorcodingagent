@@ -261,6 +261,8 @@ class SqliteStepStore:
         token: int,
         now: float,
         messages: tuple[tuple[str, str], ...],
+        trajectory: tuple[tuple[str, int | None, str], ...] = (),
+        knowledge: tuple[str, str, str, int] | None = None,
     ) -> None:
         """Move the intent to committed and write the cache and transcript.
 
@@ -274,6 +276,9 @@ class SqliteStepStore:
             token: fencing_token the caller holds.
             now: Compared with lease_expires_at using >.
             messages: Transcript rows written in this same transaction.
+            trajectory: Kind, step index, and body rows written in this same
+                transaction.
+            knowledge: Path, quote, body, and source step. None skips the note.
 
         Returns:
             None.
@@ -324,6 +329,9 @@ class SqliteStepStore:
                 (tenant_id.value, idempotency_key, result_json, digest),
             )
             self._append_messages(tenant_id, task_id, messages)
+            from agent_engine.adapters.sqlite.trajectory_store import append_open
+
+            append_open(self._connection, tenant_id, task_id, trajectory, knowledge)
             self._commit()
         except Exception:
             self._rollback()

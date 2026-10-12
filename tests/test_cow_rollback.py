@@ -77,14 +77,7 @@ def test_rollback_restores_bytes_and_marks_steps_rolled_back(tmp_path: Path) -> 
         workspace.snapshot(0)
         workspace.write("adder.py", b"later\n")
         _commit_read(store, tenant_id, "fix-adder", _WORKER, lease.fencing_token, time.time(), 1)
-        connection.execute(
-            """
-            CREATE TABLE trajectory (
-              tenant_id TEXT, task_id TEXT, seq INTEGER, step_index INTEGER,
-              kind TEXT, body_json TEXT, status TEXT
-            )
-            """
-        )
+        connection.execute("ALTER TABLE trajectory ADD COLUMN status TEXT")
         connection.execute(
             """
             INSERT INTO trajectory (tenant_id, task_id, seq, step_index, kind, body_json, status)

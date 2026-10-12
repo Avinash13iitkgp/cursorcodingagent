@@ -502,6 +502,8 @@ class StepLog(Protocol):
         token: int,
         now: float,
         messages: tuple[tuple[str, str], ...],
+        trajectory: tuple[tuple[str, int | None, str], ...] = (),
+        knowledge: tuple[str, str, str, int] | None = None,
     ) -> None:
         """Commit the step result, the cache row, and the transcript under the fence.
 
@@ -515,6 +517,8 @@ class StepLog(Protocol):
             token: Fencing token the caller holds.
             now: Instant compared with lease_expires_at.
             messages: Role and body_json rows appended in this transaction.
+            trajectory: Kind, step index, and body rows appended in this transaction.
+            knowledge: Path, quote, body, and source step. None skips the note.
 
         Returns:
             None.

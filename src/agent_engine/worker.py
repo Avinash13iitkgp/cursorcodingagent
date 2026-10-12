@@ -25,6 +25,8 @@ from pathlib import Path
 
 from agent_engine.adapters.exec.jail import Jail
 from agent_engine.adapters.mcp.client import McpClient
+from agent_engine.adapters.sqlite.trajectory_store import TrajectoryStore
+from agent_engine.application.context import ContextBuilder
 from agent_engine.adapters.llm.openai_chat import (
     CannedTransport,
     OpenAIChatLlm,
@@ -187,6 +189,8 @@ class _GuardedStore:
         token: int,
         now: float,
         messages: tuple[tuple[str, str], ...],
+        trajectory: tuple[tuple[str, int | None, str], ...] = (),
+        knowledge: tuple[str, str, str, int] | None = None,
     ) -> None:
         """Commit T2 unless the heartbeat already lost the lease.
 
@@ -200,6 +204,8 @@ class _GuardedStore:
             token: Fencing token.
             now: Instant compared with the lease expiry.
             messages: Transcript rows for this commit.
+            trajectory: Trajectory rows for this commit.
+            knowledge: Knowledge note for this commit. None skips it.
 
         Returns:
             None.
@@ -220,6 +226,8 @@ class _GuardedStore:
             token,
             now,
             messages,
+            trajectory,
+            knowledge,
         )
         self._worker.after_commit(step_index, result_json)
 
@@ -287,6 +295,23 @@ class _GuardedLlm:
         if self._worker.config.force_finish_after_stale and _saw_stale(messages):
             self._inner.tool_choice = "finish"
         return self._inner.complete(messages)
+
+    def summarize(self, messages: list[dict[str, object]]) -> str:
+        """POST a tool-free summary, or refuse when the heartbeat lost the fence.
+
+        Args:
+            messages: Prompt to compress.
+
+        Returns:
+            The assistant content from the inner client.
+
+        Raises:
+            FenceRejected: The lease was lost. The socket is closed first.
+        """
+        if self._worker.lost.is_set():
+            self._worker.close_http()
+            raise FenceRejected(self._worker.config.task_id)
+        return self._inner.summarize(messages)
 
     def close(self) -> None:
         """Close the inner socket.
@@ -357,6 +382,13 @@ class Worker:
             model = self._model(cow.work_root, mcp.chat_tools())
             guarded_model = _GuardedLlm(model, self)
             self._llm = guarded_model
+            budget = int(os.environ.get("AGENT_CONTEXT_TOKEN_BUDGET", "8000"))
+            builder = ContextBuilder(
+                TrajectoryStore(connection, worker_id, lease.fencing_token, lambda: time.time()),
+                budget=budget,
+                summarize=guarded_model.summarize,
+                secret=os.environ.get("AGENT_LLM_API_KEY", ""),
+            )
             beat = threading.Thread(target=self._heartbeat, name="lease-heartbeat")
             beat.start()
             store = _GuardedStore(SqliteStepStore(connection), self)
@@ -382,6 +414,8 @@ class Worker:
                     store,
                 ),
                 mcp,
+                builder,
+                os.environ.get("AGENT_LLM_API_KEY", ""),
             )
             try:
                 result = loop.run(now, clock=SystemClock(), resume_only=self.config.resume_only)

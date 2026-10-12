@@ -146,7 +146,48 @@ def open_tenant_db(
         connection.execute("PRAGMA query_only=ON")
     else:
         apply_pragmas(connection)
+        _ensure_context_tables(connection)
     return connection
+
+
+def _ensure_context_tables(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS knowledge (
+          tenant_id TEXT NOT NULL,
+          task_id TEXT NOT NULL,
+          note_id INTEGER NOT NULL,
+          path TEXT NOT NULL,
+          quote TEXT NOT NULL,
+          body TEXT NOT NULL,
+          source_step INTEGER NOT NULL,
+          PRIMARY KEY (tenant_id, task_id, note_id)
+        );
+        CREATE TABLE IF NOT EXISTS trajectory (
+          tenant_id TEXT NOT NULL,
+          task_id TEXT NOT NULL,
+          seq INTEGER NOT NULL,
+          step_index INTEGER,
+          kind TEXT NOT NULL CHECK (kind IN (
+            'model_inference', 'tool_call', 'tool_result', 'knowledge', 'context_summary'
+          )),
+          body_json TEXT NOT NULL,
+          PRIMARY KEY (tenant_id, task_id, seq)
+        );
+        CREATE TRIGGER IF NOT EXISTS knowledge_tenant_stamp
+        BEFORE INSERT ON knowledge
+        WHEN NEW.tenant_id != (SELECT id FROM tenant)
+        BEGIN
+          SELECT RAISE(ABORT, 'tenant mismatch');
+        END;
+        CREATE TRIGGER IF NOT EXISTS trajectory_tenant_stamp
+        BEFORE INSERT ON trajectory
+        WHEN NEW.tenant_id != (SELECT id FROM tenant)
+        BEGIN
+          SELECT RAISE(ABORT, 'tenant mismatch');
+        END;
+        """
+    )
 
 
 def _assert_tenant_row(connection: sqlite3.Connection, tenant_id: TenantId) -> None:

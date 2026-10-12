@@ -197,6 +197,8 @@ def loop(
     checks: CheckRunner,
     workspace: PlainWorkspace | None = None,
     mcp: Any = None,
+    context: Any = None,
+    secret: str = "",
 ) -> ReactLoop:
     """Wire a loop around an already leased task.
 
@@ -207,6 +209,8 @@ def loop(
         checks: Check runner.
         workspace: Work root. The default is a plain workspace.
         mcp: Optional MCP port. None leaves mcp__ names unknown.
+        context: Optional context packer.
+        secret: Bearer token redacted from notes.
 
     Returns:
         A loop that uses OptimisticEditor.
@@ -224,4 +228,6 @@ def loop(
         checks,
         gate,
         mcp,
+        context,
+        secret,
     )

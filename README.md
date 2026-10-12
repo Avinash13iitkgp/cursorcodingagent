@@ -2,7 +2,7 @@
 
 Local, multi-process coding-agent engine. Each tenant has its own SQLite database and workspace directory. A fencing token makes a stale worker unable to commit. The worker calls an OpenAI-compatible Chat Completions API with a token you provide.
 
-The build is seven steps, specified in [plan.md](plan.md). Do not start a step until the previous step's pytest gate and `self-test` gate both pass. This guide is the setup and test map. Steps 1 through 6 are implemented: `provision`, `init-task`, `pragma`, `acquire`, `renew`, `release`, `show-lease`, `jail`, `replace`, `run-task`, `demo`, MCP tool calls, and `self-test` through step 6. Step 7, the context builder, stays specified in `plan.md`.
+The build is seven steps, specified in [plan.md](plan.md). Do not start a step until the previous step's pytest gate and `self-test` gate both pass. This guide is the setup and test map. Steps 1 through 7 are implemented: `provision`, `init-task`, `pragma`, `acquire`, `renew`, `release`, `show-lease`, `jail`, `replace`, `run-task`, `demo`, MCP tool calls, `list_files`, `search_text`, `remember`, and `self-test` through step 7.
 
 ## Requirements
 
@@ -160,6 +160,12 @@ The repo ships one stdio server, `fixtures/mcp/echo_server.py`. It lists one too
 
 Each entry has `name`, `argv`, and an optional `env` list of variable names. The model cannot add a server or change that argv. A discovered tool is one ReAct step named `mcp__{server}__{tool}`. The engine starts the server with `Jail.run` in the task work root, with a 30 second timeout, once for `tools/list` and again for each `tools/call`. The session is `initialize`, `notifications/initialized`, then that method. The process exits when stdin closes. `AGENT_LLM_API_KEY` is copied only when that entry lists the name. An MCP result does not set `completed` or `rejected`.
 
+### Context budget
+
+`list_files`, `search_text`, and `remember` are ordinary ReAct steps. Search takes a literal substring and stays inside the work root. `remember` stores a path, a quote, and the model's note in that tenant file. The packer runs immediately before each model call. Order is system rules and the task prompt, then knowledge notes newest first, then the newest trajectory steps. `context_token_budget` defaults to 8000. Size is `len(text) // 4`. Set `AGENT_CONTEXT_TOKEN_BUDGET` to change it. Over budget, older tool results become an outcome line and one summary is stored as `context_summary`. The summary does not set `completed` or `rejected`.
+
+`self-test --step 7` runs canned `search_text`, `remember`, and `read_file` on task `context-demo`, then replays that task with a small `context_token_budget`.
+
 ## 8. CLI test gates
 
 Unit tests and the CLI self-test are both required.
@@ -201,6 +207,14 @@ Step 6 offline. No token, and no network:
 python -m pytest tests/test_mcp_tools.py tests/test_cli_step6.py -q --cov=agent_engine.adapters.mcp.client --cov-fail-under=85
 python -m agent_engine self-test --step 6 --data-root /tmp/agent-step6
 python -m agent_engine self-test --through 6 --data-root /tmp/agent-step6
+```
+
+Step 7 offline. No token, and no network:
+
+```bash
+python -m pytest tests/test_context_budget.py tests/test_cli_step7.py -q --cov=agent_engine.application.context --cov-fail-under=85
+python -m agent_engine self-test --step 7 --data-root /tmp/agent-step7
+python -m agent_engine self-test --through 7 --data-root /tmp/agent-step7
 ```
 
 `self-test` prints `PASS` or `FAIL` and exits 0 only when the procedure passes. `--through N` runs the offline procedures for steps 1 through N. `--live` is what turns on the real API.
@@ -248,6 +262,7 @@ That count is `0`.
 | CLI gate through step N | `self-test --through N --data-root DIR` |
 | Live CLI gate | `self-test --step N --live --data-root DIR` |
 | Echo an MCP tool | `self-test --step 6` |
+| Search, remember, and summarize | `self-test --step 7` |
 | All six demos | `demo --tenant acme --all` |
 
 Prefix tenant commands with `--data-root` when you are not using `./var`.

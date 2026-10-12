@@ -18,6 +18,8 @@ from pathlib import Path
 
 from agent_engine.adapters.exec.jail import Jail
 from agent_engine.adapters.mcp.client import McpClient
+from agent_engine.adapters.sqlite.trajectory_store import TrajectoryStore
+from agent_engine.application.context import ContextBuilder
 from agent_engine.adapters.llm.openai_chat import (
     CannedTransport,
     OpenAIChatLlm,
@@ -67,6 +69,7 @@ def run_task(
     *,
     llm: str = "live",
     tool_choice: str | None = None,
+    context_token_budget: int | None = None,
 ) -> RunResult:
     """Acquire a lease, run the loop, and release the lease.
 
@@ -76,7 +79,9 @@ def run_task(
         task_id: Task whose work root is tasks/{task_id}.
         llm: canned uses the scripted transport. Any other value is the live adapter.
         tool_choice: When llm is canned and this is finish, the scripted model
-            calls finish immediately.
+            calls finish immediately. context runs search, remember, and read_file.
+        context_token_budget: Pack budget. None reads AGENT_CONTEXT_TOKEN_BUDGET,
+            then 8000.
 
     Returns:
         The loop result. A task that is already terminal is a cache hit and
@@ -107,6 +112,18 @@ def run_task(
         try:
             mcp = McpClient(data_root, Jail(), work)
             model = _llm(data_root, tenant_id, work, llm, tool_choice, mcp.chat_tools())
+            budget = (
+                int(os.environ.get("AGENT_CONTEXT_TOKEN_BUDGET", "8000"))
+                if context_token_budget is None
+                else context_token_budget
+            )
+            log = TrajectoryStore(connection, worker_id, lease.fencing_token, lambda: time.time())
+            builder = ContextBuilder(
+                log,
+                budget=budget,
+                summarize=model.summarize,
+                secret=os.environ.get("AGENT_LLM_API_KEY", ""),
+            )
             store = SqliteStepStore(connection)
             checks = ExternalVerifier(data_root / "checks", Jail())
             loop = ReactLoop(
@@ -130,8 +147,19 @@ def run_task(
                     store,
                 ),
                 mcp,
+                builder,
+                os.environ.get("AGENT_LLM_API_KEY", ""),
             )
-            return loop.run(now, clock=SystemClock())
+            result = loop.run(now, clock=SystemClock())
+            if result.detail or not builder.last_messages:
+                return result
+            return RunResult(
+                result.status,
+                result.cache_hit,
+                result.executions,
+                result.posts,
+                json.dumps(builder.last_messages),
+            )
         finally:
             try:
                 service.release(lease, time.time())
@@ -173,6 +201,42 @@ def _live_credentials(env_name: str) -> tuple[str, str, str]:
 def _canned_bodies(work: Path, tool_choice: str | None) -> list[dict[str, object]]:
     if tool_choice == "finish":
         return [completion_body([("finish", "{}")])]
+    if tool_choice == "context":
+        return [
+            completion_body(
+                [("search_text", json.dumps({"path": ".", "query": "marker-from-helper"}))]
+            ),
+            completion_body(
+                [
+                    (
+                        "remember",
+                        json.dumps(
+                            {
+                                "path": "helper.py",
+                                "quote": "marker-from-helper",
+                                "note": "remembered-helper",
+                            }
+                        ),
+                    )
+                ]
+            ),
+            completion_body([("read_file", json.dumps({"path": "helper.py"}))]),
+            completion_body([]),
+        ]
+    if tool_choice == "budget":
+        return [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "compressed the middle",
+                        }
+                    }
+                ]
+            },
+            completion_body([]),
+        ]
     if tool_choice and tool_choice.startswith("mcp__"):
         return [
             completion_body([(tool_choice, json.dumps({"text": "ping"}))]),

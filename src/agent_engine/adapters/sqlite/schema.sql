@@ -82,3 +82,44 @@ WHEN NEW.tenant_id != (SELECT id FROM tenant)
 BEGIN
   SELECT RAISE(ABORT, 'tenant mismatch');
 END;
+
+-- Model notes for one task. The builder reads these newest first.
+CREATE TABLE knowledge (
+  tenant_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  note_id INTEGER NOT NULL,
+  path TEXT NOT NULL,
+  quote TEXT NOT NULL,
+  body TEXT NOT NULL,
+  source_step INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, task_id, note_id)
+);
+
+-- Replay log. The prompt is a packed view of these rows.
+CREATE TABLE trajectory (
+  tenant_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  step_index INTEGER,
+  kind TEXT NOT NULL CHECK (kind IN (
+    'model_inference', 'tool_call', 'tool_result', 'knowledge', 'context_summary'
+  )),
+  body_json TEXT NOT NULL,
+  PRIMARY KEY (tenant_id, task_id, seq)
+);
+
+-- Abort a knowledge row whose tenant_id disagrees with the one-row tenant table.
+CREATE TRIGGER knowledge_tenant_stamp
+BEFORE INSERT ON knowledge
+WHEN NEW.tenant_id != (SELECT id FROM tenant)
+BEGIN
+  SELECT RAISE(ABORT, 'tenant mismatch');
+END;
+
+-- Abort a trajectory row whose tenant_id disagrees with the one-row tenant table.
+CREATE TRIGGER trajectory_tenant_stamp
+BEFORE INSERT ON trajectory
+WHEN NEW.tenant_id != (SELECT id FROM tenant)
+BEGIN
+  SELECT RAISE(ABORT, 'tenant mismatch');
+END;

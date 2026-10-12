@@ -50,7 +50,15 @@ def test_llm_posts_chat_completions_with_bearer_and_parses_tool_call() -> None:
     body = json.loads(transport.body)
     assert body["model"] == "demo-model"
     names = [item["function"]["name"] for item in body["tools"]]
-    assert names == ["read_file", "replace_text", "run_checks", "finish"]
+    assert names == [
+        "read_file",
+        "replace_text",
+        "run_checks",
+        "finish",
+        "list_files",
+        "search_text",
+        "remember",
+    ]
     assert calls[0] == ToolCall("read_file", json.dumps({"path": "adder.py"}), "canned-0")
     assert calls[1].name == "run_checks"
     assert json.loads(calls[1].arguments_json) == {"unused": True}

@@ -19,6 +19,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from agent_engine.application.context import (
+    ContextBuilder,
+    list_files,
+    redact,
+    remember_note,
+    search_text,
+)
 from agent_engine.domain.errors import StaleContent
 from agent_engine.domain.models import StepView, TenantId, TextEdit, ToolCall
 from agent_engine.domain.ports import (
@@ -109,6 +116,8 @@ class ReactLoop:
         checks: CheckRunner,
         gate: FinishGate,
         mcp: McpCaller | None = None,
+        context: ContextBuilder | None = None,
+        secret: str = "",
     ) -> None:
         """Bind the loop to one lease.
 
@@ -125,6 +134,9 @@ class ReactLoop:
             checks: run_checks runner. It does not set task status.
             gate: Writer of completed and rejected. The loop does not set them.
             mcp: MCP port. None leaves mcp__ names as an unknown tool.
+            context: Packer used immediately before the model call. None packs
+                the raw history under the default budget.
+            secret: Bearer token redacted from notes and trajectory bodies.
         """
         self._tenant_id = tenant_id
         self._task_id = task_id
@@ -138,6 +150,8 @@ class ReactLoop:
         self._checks = checks
         self._gate = gate
         self._mcp = mcp
+        self._context = context or ContextBuilder()
+        self._secret = secret
         self._detail = ""
         self._instant = lambda: 0.0
 
@@ -186,7 +200,10 @@ class ReactLoop:
         queued = self._queued_call()
         messages: tuple[tuple[str, str], ...] = ()
         if queued is None:
-            calls = self._llm.complete(self._history())
+            history = self._context.pack(
+                self._tenant_id, self._task_id, self._history()
+            )
+            calls = self._llm.complete(history)
             if not calls:
                 return False
             queued, messages = self._lead_call(calls)
@@ -245,6 +262,7 @@ class ReactLoop:
             self._tenant_id, self._task_id, self._worker_id, self._token, now
         )
         args = json.loads(step.args_json)
+        knowledge = None
         if step.tool_name == "read_file":
             result = self._read_file(str(args["path"]))
         elif step.tool_name == "replace_text":
@@ -257,8 +275,27 @@ class ReactLoop:
             result = json.dumps({"status": status})
         elif step.tool_name.startswith("mcp__"):
             result = self._mcp_call(step.tool_name, args)
+        elif step.tool_name == "list_files":
+            result = self._search(list_files, args)
+        elif step.tool_name == "search_text":
+            result = self._search(search_text, args, query=str(args.get("query", "")))
+        elif step.tool_name == "remember":
+            result, knowledge = self._remember(args, step.step_index)
         else:
             result = json.dumps({"error": "unknown tool"})
+        result = redact(result, self._secret)
+        safe_args = args if isinstance(args, dict) else {}
+        safe_args = json.loads(redact(json.dumps(safe_args), self._secret))
+        trajectory = list(_trajectory(step.tool_name, step.step_index, safe_args, result))
+        if knowledge is not None:
+            path, quote, body, _source = knowledge
+            trajectory.append(
+                (
+                    "knowledge",
+                    step.step_index,
+                    json.dumps({"path": path, "quote": quote, "body": body}),
+                )
+            )
         body = json.dumps({"tool_call_id": f"call-{step.step_index}", "content": result})
         self._store.commit_step(
             self._tenant_id,
@@ -270,7 +307,38 @@ class ReactLoop:
             self._token,
             now,
             (("tool", body),),
+            tuple(trajectory),
+            knowledge,
         )
+
+    def _search(self, fn, args: dict[str, object], query: str | None = None) -> str:  # type: ignore[no-untyped-def]
+        if not isinstance(args, dict):
+            return json.dumps({"error": "unknown tool"})
+        path = str(args.get("path", "."))
+        try:
+            if query is None:
+                return str(fn(self._workspace, path))
+            return str(fn(self._workspace, query, path))
+        except ValueError as exc:
+            return json.dumps({"error": "ValueError", "detail": str(exc)})
+
+    def _remember(
+        self, args: dict[str, object], step_index: int
+    ) -> tuple[str, tuple[str, str, str, int] | None]:
+        if not isinstance(args, dict):
+            return json.dumps({"error": "unknown tool"}), None
+        try:
+            note = remember_note(
+                self._workspace,
+                str(args.get("path", "")),
+                str(args.get("quote", "")),
+                str(args.get("note", "")),
+                step_index,
+                self._secret,
+            )
+        except ValueError as exc:
+            return json.dumps({"error": "ValueError", "detail": str(exc)}), None
+        return json.dumps({"status": "remembered", "path": note[0]}), note
 
     def _mcp_call(self, name: str, args: dict[str, object]) -> str:
         if self._mcp is None or not isinstance(args, dict):
@@ -349,3 +417,17 @@ class ReactLoop:
         return RunResult(
             status, cache_hit, executions, self._llm.post_count(), self._detail
         )
+
+
+def _trajectory(
+    tool: str, step_index: int, args: dict[str, object], result: str
+) -> tuple[tuple[str, int, str], ...]:
+    try:
+        parsed: object = json.loads(result)
+    except json.JSONDecodeError:
+        parsed = result
+    return (
+        ("model_inference", step_index, json.dumps({"text": "", "tool": tool})),
+        ("tool_call", step_index, json.dumps({"tool": tool, "arguments": args})),
+        ("tool_result", step_index, json.dumps({"tool": tool, "result": parsed})),
+    )
