@@ -12,11 +12,12 @@ from agent_engine.domain.errors import (
     VerificationFailed,
 )
 from agent_engine.domain import ports as ports
-from agent_engine.domain.models import Task, Tenant, TenantId
+from agent_engine.domain.models import Lease, Task, Tenant, TenantId
 
 __all__ = [
     "AmbiguousEdit",
     "FenceRejected",
+    "Lease",
     "LeaseNotHeld",
     "StaleContent",
     "Task",

@@ -1,8 +1,9 @@
-"""Command line for tenant provisioning and the step 1 self-test.
+"""Command line for tenant provisioning and fenced leases.
 
-This module is the process edge. It opens SQLite only by calling the sqlite
-adapter, and it does not import application code. Invalid ids and tenant
-boundary errors exit non-zero. self-test prints PASS or FAIL.
+This module is the process edge. It parses arguments, opens one tenant
+database, and calls LeaseService for acquire, renew, and release. The
+scripted self-test procedure lives in agent_engine.self_test. Invalid ids,
+tenant boundary errors, and lease errors exit non-zero.
 """
 
 from __future__ import annotations
@@ -12,14 +13,24 @@ import os
 import sys
 from pathlib import Path
 
+from agent_engine.adapters.sqlite.db import open_tenant_db
+from agent_engine.adapters.sqlite.lease_store import SqliteLeaseStore
 from agent_engine.adapters.sqlite.tenant_store import (
     get_task,
     init_task,
     provision,
     read_pragmas,
 )
-from agent_engine.domain.errors import TaskNotFound, TenantMismatch, UnknownTenant
-from agent_engine.domain.models import TenantId
+from agent_engine.application.leases import LeaseService, SystemClock
+from agent_engine.domain.errors import (
+    FenceRejected,
+    LeaseNotHeld,
+    TaskNotFound,
+    TenantMismatch,
+    UnknownTenant,
+)
+from agent_engine.domain.models import Lease, TenantId
+from agent_engine.self_test import run_self_test
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -53,6 +64,13 @@ def main(argv: list[str] | None = None) -> int:
     self_test.add_argument("--through", type=int)
     self_test.add_argument("--live", action="store_true")
 
+    _add_lease_command(sub, "acquire", ttl=True)
+    _add_lease_command(sub, "renew", ttl=True, token=True)
+    _add_lease_command(sub, "release", token=True)
+    show_lease = sub.add_parser("show-lease")
+    show_lease.add_argument("--tenant", required=True)
+    show_lease.add_argument("--task", required=True)
+
     try:
         parsed = parser.parse_args(rest)
     except SystemExit as exc:
@@ -62,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
             live_status = _missing_token_if_live(parsed.live)
             if live_status != 0:
                 return live_status
-            return _self_test(data_root, parsed.step, parsed.through)
+            return run_self_test(data_root, parsed.step, parsed.through)
         tenant_id = TenantId(parsed.tenant)
         if parsed.command == "provision":
             path = provision(data_root, tenant_id, parsed.display_name)
@@ -72,12 +90,27 @@ def main(argv: list[str] | None = None) -> int:
             task = init_task(data_root, tenant_id, parsed.task)
             print(task.id)
             return 0
-        journal, synchronous, _busy = read_pragmas(data_root, tenant_id)
-        print(journal)
-        print(synchronous)
-        return 0
-    except (UnknownTenant, TenantMismatch, TaskNotFound, ValueError) as exc:
-        print(exc, file=sys.stderr)
+        if parsed.command == "pragma":
+            journal, synchronous, _busy = read_pragmas(data_root, tenant_id)
+            print(journal)
+            print(synchronous)
+            return 0
+        if parsed.command == "show-lease":
+            _print_lease(get_task(data_root, tenant_id, parsed.task))
+            return 0
+        if parsed.command in {"acquire", "renew", "release"}:
+            return _run_lease_command(data_root, tenant_id, parsed)
+        print(f"unknown command {parsed.command}", file=sys.stderr)
+        return 2
+    except (
+        UnknownTenant,
+        TenantMismatch,
+        TaskNotFound,
+        FenceRejected,
+        LeaseNotHeld,
+        ValueError,
+    ) as exc:
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
 
@@ -102,46 +135,70 @@ def _missing_token_if_live(live: bool) -> int:
     return 0
 
 
-def _self_test(data_root: Path, step: int | None, through: int | None) -> int:
-    if step is None and through is None:
-        print("FAIL", file=sys.stderr)
-        print("self-test requires --step or --through", file=sys.stderr)
-        return 1
-    last = through if through is not None else step
-    assert last is not None
-    if last != 1 or (step is not None and step != 1):
-        print("FAIL")
-        print(f"step {last} is not implemented", file=sys.stderr)
-        return 1
-    try:
-        _run_step1(data_root)
-    except (UnknownTenant, TenantMismatch, TaskNotFound, ValueError, OSError) as exc:
-        print("FAIL")
-        print(exc, file=sys.stderr)
-        return 1
-    print("PASS")
+def _add_lease_command(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+    name: str,
+    *,
+    ttl: bool = False,
+    token: bool = False,
+) -> None:
+    command = sub.add_parser(name)
+    command.add_argument("--tenant", required=True)
+    command.add_argument("--task", required=True)
+    command.add_argument("--worker-id", required=True)
+    command.add_argument("--now", type=float)
+    if ttl:
+        command.add_argument("--ttl", type=float, required=True)
+    if token:
+        command.add_argument("--token", type=int, required=True)
+
+
+def _run_lease_command(data_root: Path, tenant_id: TenantId, parsed: argparse.Namespace) -> int:
+    now = SystemClock().now() if parsed.now is None else parsed.now
+    if parsed.command == "acquire":
+        lease = _lease_call(
+            data_root,
+            tenant_id,
+            lambda service: service.acquire(parsed.task, parsed.worker_id, now, parsed.ttl),
+        )
+        print(lease.fencing_token)
+        return 0
+    held = Lease(tenant_id, parsed.task, parsed.worker_id, parsed.token, now)
+    if parsed.command == "renew":
+        lease = _lease_call(
+            data_root,
+            tenant_id,
+            lambda service: service.renew(held, now, parsed.ttl),
+        )
+        print(lease.fencing_token)
+        return 0
+    _lease_call(data_root, tenant_id, lambda service: service.release(held, now))
+    print("released")
     return 0
 
 
-def _run_step1(data_root: Path) -> None:
-    """Provision acme and globex, store fix-adder in each, and check WAL."""
-    provision(data_root, TenantId("acme"), "Acme")
-    provision(data_root, TenantId("globex"), "Globex")
-    init_task(data_root, TenantId("acme"), "fix-adder")
-    init_task(data_root, TenantId("globex"), "fix-adder")
-    journal, synchronous, _busy = read_pragmas(data_root, TenantId("acme"))
-    if journal != "wal" or synchronous != 2:
-        raise OSError(f"expected wal and 2, got {journal} and {synchronous}")
-    acme = get_task(data_root, TenantId("acme"), "fix-adder")
-    globex = get_task(data_root, TenantId("globex"), "fix-adder")
-    if acme.id != "fix-adder" or globex.id != "fix-adder":
-        raise OSError("fix-adder missing from a tenant file")
-    acme_db = data_root / "tenants" / "acme" / "engine.db"
-    globex_db = data_root / "tenants" / "globex" / "engine.db"
-    if not acme_db.is_file() or not globex_db.is_file():
-        raise OSError("expected two engine.db files")
-    if acme_db.resolve() == globex_db.resolve():
-        raise OSError("tenant databases resolved to one file")
+def _lease_call(data_root: Path, tenant_id: TenantId, fn):
+    connection = open_tenant_db(data_root, tenant_id)
+    try:
+        service = LeaseService(tenant_id, SqliteLeaseStore(connection), SystemClock())
+        return fn(service)
+    finally:
+        connection.close()
+
+
+def _print_lease(task) -> None:
+    owner = "null" if task.lease_owner is None else task.lease_owner
+    print(f"fencing_token={task.fencing_token}")
+    print(f"lease_owner={owner}")
+    print(f"lease_expires_at={_format_expiry(task.lease_expires_at)}")
+
+
+def _format_expiry(value: float | None) -> str:
+    if value is None:
+        return "null"
+    if float(value).is_integer():
+        return str(int(value))
+    return str(value)
 
 
 if __name__ == "__main__":

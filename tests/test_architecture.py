@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_engine.domain.models import Task, Tenant, TenantId
+from agent_engine.domain.models import Lease, Task, Tenant, TenantId
 
 
 def test_tenant_id_rejects_uppercase_dots_and_separators() -> None:
@@ -20,7 +20,7 @@ def test_tenant_id_rejects_uppercase_dots_and_separators() -> None:
 
 
 def test_models_are_frozen() -> None:
-    """TenantId, Tenant, and Task reject attribute assignment."""
+    """TenantId, Tenant, Task, and Lease reject attribute assignment."""
     tenant_id = TenantId("acme")
     tenant = Tenant(id=tenant_id, display_name="Acme")
     task = Task(
@@ -32,12 +32,15 @@ def test_models_are_frozen() -> None:
         lease_expires_at=None,
         workspace_root="tasks/fix-adder",
     )
+    lease = Lease(tenant_id, "fix-adder", "worker-a", 1, 10.0)
     with pytest.raises(FrozenInstanceError):
         tenant_id.value = "globex"  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         tenant.display_name = "Other"  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         task.status = "running"  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        lease.fencing_token = 2  # type: ignore[misc]
     with pytest.raises(ValueError):
         Task(
             tenant_id=tenant_id,
@@ -61,10 +64,10 @@ def test_models_are_frozen() -> None:
 
 
 def test_domain_imports_neither_sqlite_nor_adapters() -> None:
-    """domain/ does not import sqlite3, subprocess, os.killpg, or adapters."""
-    root = Path(__file__).resolve().parents[1] / "src" / "agent_engine" / "domain"
+    """domain/ and application/ do not import sqlite3, subprocess, os.killpg, or adapters."""
+    root = Path(__file__).resolve().parents[1] / "src" / "agent_engine"
     banned_roots = {"sqlite3", "subprocess"}
-    for path in root.rglob("*.py"):
+    for path in (*root.joinpath("domain").rglob("*.py"), *root.joinpath("application").rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):

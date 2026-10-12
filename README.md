@@ -2,7 +2,7 @@
 
 Local, multi-process coding-agent engine. Each tenant has its own SQLite database and workspace directory. A fencing token makes a stale worker unable to commit. The worker calls an OpenAI-compatible Chat Completions API with a token you provide.
 
-The build is five steps, specified in [plan.md](plan.md). Do not start a step until the previous step's pytest gate and `self-test` gate both pass. This guide is the setup and test map. Step 1 is implemented: `provision`, `init-task`, `pragma`, and `self-test --step 1`. Steps 2 through 5 stay specified in `plan.md`, and their commands are added as those steps land.
+The build is five steps, specified in [plan.md](plan.md). Do not start a step until the previous step's pytest gate and `self-test` gate both pass. This guide is the setup and test map. Steps 1 and 2 are implemented: `provision`, `init-task`, `pragma`, `acquire`, `renew`, `release`, `show-lease`, and `self-test --step 1`, `--step 2`, and `--through 2`. Steps 3 through 5 stay specified in `plan.md`.
 
 ## Requirements
 
@@ -81,7 +81,12 @@ Offline work does not need a token. Pass `--llm canned` to `run-task`, or run `s
 
 ## 5. Leases
 
-Worker ids are UUIDs. `--now` is a unix timestamp used by the framework test so it does not sleep.
+Worker ids are UUIDs, not process ids. `--now` is a unix timestamp used by the framework test so it does not sleep. These commands are implemented. `self-test --step 2` runs the lease procedure. `self-test --through 2` runs steps 1 and 2.
+
+```bash
+python -m agent_engine self-test --step 2 --data-root /tmp/agent-step2
+python -m agent_engine self-test --through 2 --data-root /tmp/agent-step2
+```
 
 ```bash
 python -m agent_engine --data-root /tmp/agent-demo acquire --tenant acme --task fix-adder --worker-id "$WORKER" --now 0 --ttl 10
@@ -90,7 +95,7 @@ python -m agent_engine --data-root /tmp/agent-demo renew --tenant acme --task fi
 python -m agent_engine --data-root /tmp/agent-demo release --tenant acme --task fix-adder --worker-id "$WORKER" --token 1
 ```
 
-Renew keeps the same fencing token. A second worker inside the TTL gets `LeaseNotHeld`. After expiry, acquire returns the next token. `globex` is a different file and is unchanged.
+Renew keeps the same fencing token and sets expiry to `--now` plus `--ttl`. A second worker inside that expiry gets `LeaseNotHeld`. After expiry, acquire returns the next token. An acquire at `--now 0 --ttl 10` followed by renew at `--now 5 --ttl 10` expires at 15, so the next worker acquires at `--now 15`. `globex` is a different file and is unchanged.
 
 ## 6. Jail and edits
 
@@ -124,7 +129,7 @@ Unit tests and the CLI self-test are both required.
 Offline, steps 1 through 4, no token:
 
 ```bash
-python -m pytest tests/test_architecture.py tests/test_sqlite_wal.py tests/test_cli_step1.py -q --cov=agent_engine.domain --cov=agent_engine.adapters.sqlite --cov-fail-under=90
+python -m pytest tests/test_architecture.py tests/test_sqlite_wal.py tests/test_cli_step1.py -q --cov=agent_engine.domain --cov=agent_engine.adapters.sqlite.db --cov=agent_engine.adapters.sqlite.tenant_store --cov-fail-under=90
 python -m agent_engine self-test --step 1 --data-root /tmp/agent-step1
 
 python -m pytest tests/test_leases.py tests/test_cli_step2.py -q --cov=agent_engine.application.leases --cov=agent_engine.adapters.sqlite.lease_store --cov-fail-under=90

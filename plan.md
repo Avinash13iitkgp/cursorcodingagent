@@ -117,7 +117,7 @@ Coverage floor: 90% on `agent_engine.domain` and `agent_engine.adapters.sqlite`.
 ### Exit gate
 
 ```bash
-python -m pytest tests/test_architecture.py tests/test_sqlite_wal.py tests/test_cli_step1.py -q --cov=agent_engine.domain --cov=agent_engine.adapters.sqlite --cov-fail-under=90
+python -m pytest tests/test_architecture.py tests/test_sqlite_wal.py tests/test_cli_step1.py -q --cov=agent_engine.domain --cov=agent_engine.adapters.sqlite.db --cov=agent_engine.adapters.sqlite.tenant_store --cov-fail-under=90
 python -m agent_engine self-test --step 1 --data-root /tmp/agent-step1
 ```
 
@@ -125,7 +125,7 @@ python -m agent_engine self-test --step 1 --data-root /tmp/agent-step1
 
 ### Architectural choices
 
-- `LeaseService` is constructed with one `TenantId`, one connection from `open_tenant_db`, and a `Clock`. Production clock is `time.time`. Tests pass `ManualClock`.
+- `LeaseService` is constructed with one `TenantId`, a `LeaseStore` already bound to one connection from `open_tenant_db`, and a `Clock`. The service does not import sqlite3. Production clock is `time.time`. Tests pass `ManualClock`.
 - Methods: `acquire(task_id, worker_id, now, ttl) -> Lease`, `renew(lease, now, ttl) -> Lease`, `release(lease, now) -> None`, `commit_marker(lease, now) -> None`.
 - `worker_id` is a UUID string minted by the process. Tests mint their own UUIDs.
 - `acquire` runs the steal statement inside `BEGIN IMMEDIATE` and returns the new token. Zero rows while the lease is unexpired raises `LeaseNotHeld` and leaves the token unchanged. Zero rows because the task is absent raises `TaskNotFound`.
@@ -147,7 +147,7 @@ Two workers share a tenant only through that tenant's `engine.db`. A `globex` se
 
 ### Files
 
-`src/agent_engine/application/leases.py`, `src/agent_engine/adapters/sqlite/lease_store.py`, `tests/test_leases.py`, `tests/test_cli_step2.py`. Extend the CLI in `src/agent_engine/__main__.py` and the lease section of `README.md`.
+`src/agent_engine/application/leases.py`, `src/agent_engine/adapters/sqlite/lease_store.py`, `src/agent_engine/self_test.py`, `tests/test_leases.py`, `tests/test_cli_step2.py`. `__main__.py` dispatches acquire, renew, release, and self-test. The fixed tenants, worker ids, and timestamps live in `self_test.py`. Extend the lease section of `README.md`.
 
 ### Unit tests
 
@@ -173,7 +173,7 @@ Coverage floor: 90% on `agent_engine.application.leases` and `agent_engine.adapt
 3. `show-lease --tenant acme --task fix-adder` shows owner `<uuid-a>` and token `1`.
 4. `renew` with that token and `--now 5 --ttl 10` still prints token `1`.
 5. `acquire` with `<uuid-b>` and `--now 5` exits non-zero with `LeaseNotHeld`. `show-lease` still shows token `1`.
-6. `acquire` with `<uuid-b>` and `--now 11` prints token `2`.
+6. `acquire` with `<uuid-b>` and `--now 15` prints token `2`. Renew at `--now 5 --ttl 10` set the expiry to 15, so `--now 11` is still inside the lease.
 7. `show-lease --tenant globex --task fix-adder` still shows token `0` and a null owner.
 8. Re-run the step 2 unit-test command. Both must pass.
 

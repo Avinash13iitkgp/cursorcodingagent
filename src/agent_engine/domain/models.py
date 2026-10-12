@@ -1,7 +1,7 @@
 """Frozen domain values. This module performs no I/O.
 
-Types: TenantId, Tenant, and Task. Constructing them does not touch the filesystem
-or SQLite. Invalid tenant ids raise ValueError.
+Types: TenantId, Tenant, Task, and Lease. Constructing them does not touch the
+filesystem or SQLite. Invalid tenant ids raise ValueError.
 """
 
 from __future__ import annotations
@@ -56,3 +56,19 @@ class Task:
             raise ValueError("task id must match ^[a-z0-9][a-z0-9_-]{0,63}$")
         if self.workspace_root != f"tasks/{self.id}":
             raise ValueError("workspace_root must be tasks/{task id}")
+
+
+@dataclass(frozen=True)
+class Lease:
+    """A worker's right to commit for one task.
+
+    fencing_token is the capability to commit. expires_at is only a liveness
+    hint: a stale token is rejected even when the clock still says the lease
+    is current, and a clock expiry only lets another worker acquire a new token.
+    """
+
+    tenant_id: TenantId
+    task_id: str
+    worker_id: str
+    fencing_token: int
+    expires_at: float
