@@ -146,11 +146,11 @@ def open_tenant_db(
         connection.execute("PRAGMA query_only=ON")
     else:
         apply_pragmas(connection)
-        _ensure_context_tables(connection)
+        _ensure_tables(connection)
     return connection
 
 
-def _ensure_context_tables(connection: sqlite3.Connection) -> None:
+def _ensure_tables(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS knowledge (
@@ -182,6 +182,20 @@ def _ensure_context_tables(connection: sqlite3.Connection) -> None:
         END;
         CREATE TRIGGER IF NOT EXISTS trajectory_tenant_stamp
         BEFORE INSERT ON trajectory
+        WHEN NEW.tenant_id != (SELECT id FROM tenant)
+        BEGIN
+          SELECT RAISE(ABORT, 'tenant mismatch');
+        END;
+        CREATE TABLE IF NOT EXISTS task_plans (
+          tenant_id TEXT NOT NULL,
+          task_id TEXT NOT NULL,
+          prompt TEXT NOT NULL,
+          body_json TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('proposed', 'accepted')),
+          PRIMARY KEY (tenant_id, task_id)
+        );
+        CREATE TRIGGER IF NOT EXISTS task_plans_tenant_stamp
+        BEFORE INSERT ON task_plans
         WHEN NEW.tenant_id != (SELECT id FROM tenant)
         BEGIN
           SELECT RAISE(ABORT, 'tenant mismatch');

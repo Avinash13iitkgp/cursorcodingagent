@@ -108,6 +108,24 @@ CREATE TABLE trajectory (
   PRIMARY KEY (tenant_id, task_id, seq)
 );
 
+-- One stored plan per task. status is proposed until an operator accepts it.
+CREATE TABLE task_plans (
+  tenant_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  body_json TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('proposed', 'accepted')),
+  PRIMARY KEY (tenant_id, task_id)
+);
+
+-- Abort a plan row whose tenant_id disagrees with the one-row tenant table.
+CREATE TRIGGER task_plans_tenant_stamp
+BEFORE INSERT ON task_plans
+WHEN NEW.tenant_id != (SELECT id FROM tenant)
+BEGIN
+  SELECT RAISE(ABORT, 'tenant mismatch');
+END;
+
 -- Abort a knowledge row whose tenant_id disagrees with the one-row tenant table.
 CREATE TRIGGER knowledge_tenant_stamp
 BEFORE INSERT ON knowledge

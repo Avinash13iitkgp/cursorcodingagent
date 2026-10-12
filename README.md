@@ -136,7 +136,7 @@ python -m agent_engine --data-root /tmp/agent-demo run-task --tenant acme --task
 
 ### MCP tools
 
-The model is always offered four built-in tools: `read_file`, `replace_text`, `run_checks`, and `finish`. MCP tools are extra. They come from `{data-root}/mcp.json`. With that file absent, nothing is discovered, and a name that starts with `mcp__` is stored as `{"error": "unknown tool"}`.
+The model is always offered the built-in tools `read_file`, `replace_text`, `write_file`, `run_checks`, and `finish`. MCP tools are extra. They come from `{data-root}/mcp.json`. With that file absent, nothing is discovered, and a name that starts with `mcp__` is stored as `{"error": "unknown tool"}`.
 
 The repo ships one stdio server, `fixtures/mcp/echo_server.py`. It lists one tool:
 
@@ -166,6 +166,21 @@ Each entry has `name`, `argv`, and an optional `env` list of variable names. The
 
 `self-test --step 7` runs canned `search_text`, `remember`, and `read_file` on task `context-demo`, then replays that task with a small `context_token_budget`.
 
+### Prompt, plan, then build a tree
+
+`run-task` and the demos keep the adder prompt. A new project starts from a prompt instead. `plan` makes one model call whose only tool is `submit_plan`, so that call cannot return a file tool. It stores the file list as `proposed` and writes nothing in the work tree. `accept` marks that row `accepted` with no model call and no file write. `apply` refuses a plan that is not accepted, then runs the ReAct loop with the prompt and the accepted plan pinned in the pack. `show-plan` prints the stored prompt, status, and tree.
+
+```bash
+python -m agent_engine --data-root /tmp/agent-plan plan --tenant acme --task api-tree --prompt 'Build a small api package with tests.'
+python -m agent_engine --data-root /tmp/agent-plan show-plan --tenant acme --task api-tree
+python -m agent_engine --data-root /tmp/agent-plan accept --tenant acme --task api-tree
+python -m agent_engine --data-root /tmp/agent-plan apply --tenant acme --task api-tree --checks-cmd 'python -m pytest -q'
+```
+
+`--llm canned` works on `plan` and `apply` with no token and no network. Re-running `plan` replaces a `proposed` plan and exits non-zero once the plan is `accepted` or the task is terminal. `apply` takes `--max-steps`, default 32, and a tree that hits the cap stays `running` so a later `apply` resumes it. `--checks-cmd` may be repeated and writes `{data-root}/checks/commands` before the loop. Those commands are the operator gate: the model does not choose them and cannot write that directory. Test files the agent writes live inside the task work tree, so pass `--checks-cmd 'python -m pytest -q'` to run them.
+
+`write_file` is a normal ReAct step next to `replace_text`. The path is relative, and `..` or an absolute path returns an error and writes nothing. Parent directories are created with the file, so `services/api/tests/test_app.py` creates the directories on the way down. An existing file is not replaced: updates stay on `replace_text` with the hash from `read_file`. A directory exists because a file was written under it. `apply` creates the work root when the task has no `base/` snapshot, and still seeds `base/` into `work/` when it has one.
+
 ## 8. CLI test gates
 
 Unit tests and the CLI self-test are both required.
@@ -182,7 +197,7 @@ python -m agent_engine self-test --through 2 --data-root /tmp/agent-step2
 python -m pytest tests/test_jail.py tests/test_optimistic_edit.py tests/test_cli_step3.py -q --cov=agent_engine.adapters.exec.jail --cov=agent_engine.adapters.workspace.edits --cov-fail-under=90
 python -m agent_engine self-test --through 3 --data-root /tmp/agent-step3
 
-python -m pytest tests/test_architecture.py tests/test_llm_adapter.py tests/test_idempotency.py tests/test_verifier_gate.py tests/test_react_happy.py tests/test_cli_step4.py -q --cov=agent_engine.application --cov=agent_engine.adapters.llm --cov=agent_engine.adapters.verifier --cov=agent_engine.adapters.workspace.plain --cov-fail-under=85 -k "not live"
+python -m pytest tests/test_architecture.py tests/test_llm_adapter.py tests/test_idempotency.py tests/test_verifier_gate.py tests/test_react_happy.py tests/test_plan_tree.py tests/test_cli_step4.py -q --cov=agent_engine.application --cov=agent_engine.adapters.llm --cov=agent_engine.adapters.verifier --cov=agent_engine.adapters.workspace.plain --cov-fail-under=85 -k "not live"
 python -m agent_engine self-test --through 4 --data-root /tmp/agent-step4
 ```
 
@@ -258,6 +273,10 @@ That count is `0`.
 | Compare-and-swap a file | `replace --root ... --expected-sha256 ...` |
 | Run offline | `run-task --llm canned` |
 | Run against your token | `run-task` with the three env vars set |
+| Plan a tree for a prompt | `plan --tenant acme --task api-tree --prompt '...'` |
+| Read the stored plan | `show-plan --tenant acme --task api-tree` |
+| Accept a plan | `accept --tenant acme --task api-tree` |
+| Build the accepted tree | `apply --tenant acme --task api-tree --checks-cmd '...'` |
 | CLI gate for one step | `self-test --step N --data-root DIR` |
 | CLI gate through step N | `self-test --through N --data-root DIR` |
 | Live CLI gate | `self-test --step N --live --data-root DIR` |

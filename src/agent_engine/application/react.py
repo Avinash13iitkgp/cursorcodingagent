@@ -5,8 +5,10 @@ insert and it does not call the model. intent_logged resumes that row and does
 not call the model. No row calls the model, then T1 inserts exactly one tool
 call and commits before any file write or command. Extra tool calls in one
 message become later steps. T2 then writes the result, the cache row, and the
-transcript under the fence. The loop stops at 8 agent steps. finish does not
-set completed or rejected; VerifyGate is the only writer of those statuses.
+transcript under the fence. The loop stops at max_steps agent steps, 8 by
+default. write_file creates a new path and its parent directories; an
+existing file stays on replace_text. finish does not set completed or
+rejected; VerifyGate is the only writer of those statuses.
 This module does not import sqlite or adapters. A name that starts with
 mcp__ is one step on the MCP port when that port is bound.
 """
@@ -118,6 +120,8 @@ class ReactLoop:
         mcp: McpCaller | None = None,
         context: ContextBuilder | None = None,
         secret: str = "",
+        prompt: str | None = None,
+        max_steps: int = _MAX_STEPS,
     ) -> None:
         """Bind the loop to one lease.
 
@@ -137,6 +141,10 @@ class ReactLoop:
             context: Packer used immediately before the model call. None packs
                 the raw history under the default budget.
             secret: Bearer token redacted from notes and trajectory bodies.
+            prompt: First user message. None keeps the adder sentence, which
+                run-task and the demos use.
+            max_steps: Agent steps this run may reach. apply passes a larger
+                cap so a small tree fits in one run.
         """
         self._tenant_id = tenant_id
         self._task_id = task_id
@@ -152,13 +160,15 @@ class ReactLoop:
         self._mcp = mcp
         self._context = context or ContextBuilder()
         self._secret = secret
+        self._prompt = _PROMPT if prompt is None else prompt
+        self._max_steps = max_steps
         self._detail = ""
         self._instant = lambda: 0.0
 
     def run(
         self, now: float, *, clock: Clock | None = None, resume_only: bool = False
     ) -> RunResult:
-        """Drive steps until a terminal status, an empty model turn, or 8 steps.
+        """Drive steps until a terminal status, an empty model turn, or the cap.
 
         Args:
             now: Instant compared with lease_expires_at when clock is omitted.
@@ -191,7 +201,7 @@ class ReactLoop:
             status = self._store.task_status(self._tenant_id, self._task_id)
             if status in _TERMINAL:
                 return self._result(status, True, executions)
-            if self._store.agent_count(self._tenant_id, self._task_id) >= _MAX_STEPS:
+            if self._store.agent_count(self._tenant_id, self._task_id) >= self._max_steps:
                 return self._result(status, False, executions)
             if not self._prepare_next():
                 return self._result(status, False, executions)
@@ -252,7 +262,7 @@ class ReactLoop:
         }
         rows: list[tuple[str, str]] = []
         if not self._store.list_messages(self._tenant_id, self._task_id):
-            rows.append(("user", json.dumps({"content": _PROMPT})))
+            rows.append(("user", json.dumps({"content": self._prompt})))
         rows.append(("assistant", json.dumps(assistant)))
         return numbered[0], tuple(rows)
 
@@ -267,6 +277,8 @@ class ReactLoop:
             result = self._read_file(str(args["path"]))
         elif step.tool_name == "replace_text":
             result = self._replace(args)
+        elif step.tool_name == "write_file":
+            result = self._write_file(args)
         elif step.tool_name == "run_checks":
             ok, stdout, stderr = self._checks.run(self._work_root)
             result = json.dumps({"ok": ok, "stdout": stdout, "stderr": stderr})
@@ -374,6 +386,20 @@ class ReactLoop:
             return json.dumps({"error": "StaleContent", "sha256": current})
         return json.dumps({"status": outcome.status})
 
+    def _write_file(self, args: dict[str, object]) -> str:
+        if not isinstance(args, dict):
+            return json.dumps({"error": "unknown tool"})
+        path = str(args.get("path", ""))
+        try:
+            _guard_new_path(path)
+            target = self._workspace.resolve(path)
+        except ValueError as exc:
+            return json.dumps({"error": "ValueError", "detail": str(exc)})
+        if target.exists():
+            return json.dumps({"error": "FileExists", "path": path})
+        self._workspace.write(path, str(args.get("content", "")).encode("utf-8"))
+        return json.dumps({"status": "written", "path": path})
+
     def _queued_call(self) -> ToolCall | None:
         rows = self._store.list_messages(self._tenant_id, self._task_id)
         last_body: dict[str, object] | None = None
@@ -405,7 +431,7 @@ class ReactLoop:
     def _history(self) -> list[dict[str, object]]:
         rows = self._store.list_messages(self._tenant_id, self._task_id)
         if not rows:
-            return [{"role": "user", "content": _PROMPT}]
+            return [{"role": "user", "content": self._prompt}]
         history: list[dict[str, object]] = []
         for _seq, role, body in rows:
             payload = json.loads(body)
@@ -417,6 +443,12 @@ class ReactLoop:
         return RunResult(
             status, cache_hit, executions, self._llm.post_count(), self._detail
         )
+
+
+def _guard_new_path(relative_path: str) -> None:
+    path = Path(relative_path)
+    if not relative_path or path.is_absolute() or ".." in path.parts:
+        raise ValueError("path must stay under the work root")
 
 
 def _trajectory(

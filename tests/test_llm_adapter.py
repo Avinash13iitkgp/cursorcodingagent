@@ -53,6 +53,7 @@ def test_llm_posts_chat_completions_with_bearer_and_parses_tool_call() -> None:
     assert names == [
         "read_file",
         "replace_text",
+        "write_file",
         "run_checks",
         "finish",
         "list_files",
@@ -62,6 +63,19 @@ def test_llm_posts_chat_completions_with_bearer_and_parses_tool_call() -> None:
     assert calls[0] == ToolCall("read_file", json.dumps({"path": "adder.py"}), "canned-0")
     assert calls[1].name == "run_checks"
     assert json.loads(calls[1].arguments_json) == {"unused": True}
+    assert llm.post_count() == 1
+
+
+def test_plan_sends_submit_plan_as_the_only_tool() -> None:
+    """A planning turn offers submit_plan and no file tool."""
+    body = json.dumps({"summary": "ok", "files": [{"path": "app.py", "action": "create"}]})
+    transport = _Capture(completion_body([("submit_plan", body)]))
+    llm = OpenAIChatLlm("https://example.test/v1", "token", "demo-model", transport)
+    calls = llm.plan([{"role": "user", "content": "build an api"}])
+    request = json.loads(transport.body)
+    assert [item["function"]["name"] for item in request["tools"]] == ["submit_plan"]
+    assert request["tool_choice"]["function"]["name"] == "submit_plan"
+    assert calls[0].name == "submit_plan"
     assert llm.post_count() == 1
 
 

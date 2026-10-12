@@ -1,11 +1,13 @@
-"""Command line for tenant provisioning, leases, the jail, edits, run-task, and demos.
+"""Command line for tenants, leases, the jail, edits, plans, run-task, and demos.
 
 This module is the process edge. It parses arguments, opens one tenant
 database, and calls LeaseService for acquire, renew, and release. jail and
 replace do not take a tenant. run-task wires the loop through composition.
-demo starts the scenarios. The scripted self-test procedure lives in
-agent_engine.self_test. Invalid ids, tenant boundary errors, lease errors,
-and edit errors exit non-zero.
+plan stores a proposed tree for a prompt, accept marks it accepted, show-plan
+prints it, and apply runs the loop only after that accept. demo starts the
+scenarios. The scripted self-test procedure lives in agent_engine.self_test.
+Invalid ids, tenant boundary errors, lease errors, a plan that is not
+accepted, and edit errors exit non-zero.
 """
 
 from __future__ import annotations
@@ -26,7 +28,14 @@ from agent_engine.adapters.sqlite.tenant_store import (
 )
 from agent_engine.adapters.workspace.edits import FlatWorkspace, OptimisticEditor
 from agent_engine.application.leases import LeaseService, SystemClock
-from agent_engine.composition import format_report, run_task
+from agent_engine.composition import (
+    accept_plan,
+    apply_plan,
+    format_report,
+    propose_plan,
+    run_task,
+    show_plan,
+)
 from agent_engine.demo import run_scenarios
 from agent_engine.domain.errors import (
     AmbiguousEdit,
@@ -97,6 +106,27 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--llm", choices=("canned", "live"), default="live")
     run.add_argument("--tool-choice")
 
+    plan_cmd = sub.add_parser("plan")
+    plan_cmd.add_argument("--tenant", required=True)
+    plan_cmd.add_argument("--task", required=True)
+    plan_cmd.add_argument("--prompt", required=True)
+    plan_cmd.add_argument("--llm", choices=("canned", "live"), default="live")
+
+    accept_cmd = sub.add_parser("accept")
+    accept_cmd.add_argument("--tenant", required=True)
+    accept_cmd.add_argument("--task", required=True)
+
+    show_plan_cmd = sub.add_parser("show-plan")
+    show_plan_cmd.add_argument("--tenant", required=True)
+    show_plan_cmd.add_argument("--task", required=True)
+
+    apply_cmd = sub.add_parser("apply")
+    apply_cmd.add_argument("--tenant", required=True)
+    apply_cmd.add_argument("--task", required=True)
+    apply_cmd.add_argument("--llm", choices=("canned", "live"), default="live")
+    apply_cmd.add_argument("--max-steps", type=int, default=32)
+    apply_cmd.add_argument("--checks-cmd", action="append", default=[])
+
     demo_cmd = sub.add_parser("demo")
     demo_cmd.add_argument("--tenant", required=True)
     demo_cmd.add_argument("--scenario", type=int)
@@ -145,6 +175,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(format_report(report))
             return 0
+        if parsed.command in {"plan", "accept", "show-plan", "apply"}:
+            return _run_plan_command(data_root, tenant_id, parsed)
         if parsed.command == "demo":
             return _run_demo(data_root, parsed)
         if parsed.command in {"acquire", "renew", "release"}:
@@ -164,6 +196,35 @@ def main(argv: list[str] | None = None) -> int:
     ) as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
+
+
+def _run_plan_command(
+    data_root: Path, tenant_id: TenantId, parsed: argparse.Namespace
+) -> int:
+    if parsed.command == "plan":
+        print(
+            propose_plan(
+                data_root, tenant_id, parsed.task, parsed.prompt, llm=parsed.llm
+            )
+        )
+        return 0
+    if parsed.command == "accept":
+        accept_plan(data_root, tenant_id, parsed.task)
+        print("accepted")
+        return 0
+    if parsed.command == "show-plan":
+        print(show_plan(data_root, tenant_id, parsed.task))
+        return 0
+    report = apply_plan(
+        data_root,
+        tenant_id,
+        parsed.task,
+        llm=parsed.llm,
+        max_steps=parsed.max_steps,
+        checks_cmd=tuple(parsed.checks_cmd),
+    )
+    print(format_report(report))
+    return 0
 
 
 def _run_demo(data_root: Path, parsed: argparse.Namespace) -> int:

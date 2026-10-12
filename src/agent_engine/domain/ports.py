@@ -572,6 +572,56 @@ class StepLog(Protocol):
         ...  # pragma: no cover
 
 
+class PlanStore(Protocol):
+    """One plan row per task inside one tenant database."""
+
+    def read(self, tenant_id: TenantId, task_id: str) -> tuple[str, str, str] | None:
+        """Return the stored plan.
+
+        Args:
+            tenant_id: Tenant bound to this store.
+            task_id: Task primary key.
+
+        Returns:
+            Prompt, body_json, and status, or None when the task has no plan.
+        """
+        ...  # pragma: no cover
+
+    def propose(
+        self, tenant_id: TenantId, task_id: str, prompt: str, body_json: str
+    ) -> None:
+        """Store one proposed plan, replacing an earlier proposal.
+
+        Args:
+            tenant_id: Tenant bound to this store.
+            task_id: Task primary key.
+            prompt: User sentence this plan answers.
+            body_json: Validated plan body.
+
+        Returns:
+            None. This method does not write files.
+
+        Raises:
+            ValueError: The stored plan is already accepted.
+        """
+        ...  # pragma: no cover
+
+    def accept(self, tenant_id: TenantId, task_id: str) -> None:
+        """Move the stored plan to accepted.
+
+        Args:
+            tenant_id: Tenant bound to this store.
+            task_id: Task primary key.
+
+        Returns:
+            None. No model call and no file write.
+
+        Raises:
+            ValueError: The task has no plan row.
+        """
+        ...  # pragma: no cover
+
+
 class McpCaller(Protocol):
     """One stdio MCP call. The loop does not start the server itself."""
 

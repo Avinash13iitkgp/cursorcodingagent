@@ -1,7 +1,8 @@
 """Context packer for one model call.
 
-Pack order is fixed: system rules and the task prompt, then knowledge notes
-newest first, then the newest trajectory steps in full. Size is len(text) // 4.
+Pack order is fixed: system rules, the task sentence, and an accepted plan,
+then knowledge notes newest first, then the newest trajectory steps in full.
+That first message is never shrunk. Size is len(text) // 4.
 When that estimate exceeds the budget, older tool results shrink to an outcome
 line: tool name, StaleContent or exit code, and the sha256. File bodies are
 not repeated. If the pack is still over, one tool-free summary call compresses
@@ -20,8 +21,10 @@ from agent_engine.domain.models import TenantId
 from agent_engine.domain.ports import Workspace
 
 _RULES = (
-    "Use read_file, replace_text, run_checks, finish, list_files, search_text, and remember. "
-    "Do not modify checks or add a compiler install. Search is not a shell."
+    "Use read_file, replace_text, write_file, run_checks, finish, list_files, "
+    "search_text, and remember. write_file creates a new path. An existing file "
+    "stays on replace_text. Do not modify checks or add a compiler install. "
+    "Search is not a shell."
 )
 _TASK = "Fix adder.py so add(a, b) returns a + b."
 _KINDS = ("model_inference", "tool_call", "tool_result")
@@ -81,6 +84,8 @@ class ContextBuilder:
         budget: int = 8000,
         summarize=None,  # type: ignore[no-untyped-def]
         secret: str = "",
+        task: str | None = None,
+        plan: str = "",
     ) -> None:
         """Bind the packer to one log and one budget.
 
@@ -90,6 +95,10 @@ class ContextBuilder:
             summarize: Tool-free completion. None skips the summary call.
             secret: Bearer token removed from notes, trajectory text, and the
                 summary request.
+            task: Task sentence packed with the system rules. None keeps the
+                adder sentence run-task and the demos use.
+            plan: Accepted plan packed with the system rules. It is not
+                truncated and is not shrunk when the pack is over budget.
 
         Returns:
             None.
@@ -98,6 +107,8 @@ class ContextBuilder:
         self._budget = budget
         self._summarize = summarize
         self._secret = secret
+        self._task = _TASK if task is None else task
+        self._plan = plan
         self.last_messages: list[dict[str, object]] = []
 
     def pack(
@@ -127,11 +138,12 @@ class ContextBuilder:
             return shrunk
         notes = self._log.list_knowledge(tenant_id, task_id)
         rows = self._log.list_trajectory(tenant_id, task_id)
-        full = _render(notes, rows, shrink=False, summary="")
+        system = self._system()
+        full = _render(notes, rows, shrink=False, summary="", system=system)
         if _tokens(full) <= self._budget:
             self.last_messages = full
             return full
-        shrunk = _render(notes, rows, shrink=True, summary="")
+        shrunk = _render(notes, rows, shrink=True, summary="", system=system)
         if _tokens(shrunk) <= self._budget:
             self.last_messages = shrunk
             return shrunk
@@ -139,9 +151,15 @@ class ContextBuilder:
         summary = self._summary(middle)
         if summary:
             self._log.write_summary(tenant_id, task_id, redact(summary, self._secret))
-        packed = _render(notes, rows, shrink=True, summary=summary)
+        packed = _render(notes, rows, shrink=True, summary=summary, system=system)
         self.last_messages = packed
         return packed
+
+    def _system(self) -> str:
+        text = f"{_RULES}\n{self._task}"
+        if self._plan:
+            return f"{text}\n{self._plan}"
+        return text
 
     def _summary(self, middle: str) -> str:
         cleaned = redact(middle, self._secret)
@@ -297,10 +315,9 @@ def _render(
     *,
     shrink: bool,
     summary: str,
+    system: str,
 ) -> list[dict[str, object]]:
-    messages: list[dict[str, object]] = [
-        {"role": "system", "content": _RULES + "\n" + _TASK}
-    ]
+    messages: list[dict[str, object]] = [{"role": "system", "content": system}]
     for _note_id, path, quote, body in notes:
         messages.append({"role": "user", "content": f"note {path}: {quote}\n{body}"})
     if summary:

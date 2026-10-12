@@ -1,10 +1,12 @@
 """OpenAI-compatible Chat Completions.
 
 complete POSTs {base_url}/chat/completions with Authorization: Bearer and the
-tools read_file, replace_text, run_checks, and finish. A caller may append
-tools it already discovered. The socket timeout is 60 seconds. The request
-log stores Bearer [redacted] and never the token. Parsing reads tool_calls
-off the first choice. This module does not choose an MCP server or its argv.
+tools read_file, replace_text, write_file, run_checks, and finish. A caller
+may append tools it already discovered. plan POSTs the same endpoint with
+submit_plan as the only tool, so a planning turn cannot answer with a file
+tool. The socket timeout is 60 seconds. The request log stores Bearer
+[redacted] and never the token. Parsing reads tool_calls off the first
+choice. This module does not choose an MCP server or its argv.
 """
 
 from __future__ import annotations
@@ -43,6 +45,21 @@ _TOOLS = [
                     "new": {"type": "string"},
                 },
                 "required": ["path", "expected_sha256", "old", "new"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Create one new file, with its parent directories.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
             },
         },
     },
@@ -104,6 +121,35 @@ _TOOLS = [
             },
         },
     },
+]
+
+_PLAN_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_plan",
+            "description": "Submit the file list for this prompt. It writes nothing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "files": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "action": {"type": "string", "enum": ["create", "edit"]},
+                                "detail": {"type": "string"},
+                            },
+                            "required": ["path", "action"],
+                        },
+                    },
+                },
+                "required": ["summary", "files"],
+            },
+        },
+    }
 ]
 
 
@@ -285,6 +331,38 @@ class OpenAIChatLlm:
                 "type": "function",
                 "function": {"name": self.tool_choice},
             }
+        body = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        self._log(headers, body)
+        raw = self._transport.post(self._url, headers, body, self._timeout_s)
+        return _parse_calls(raw)
+
+    def plan(self, messages: list[dict[str, object]]) -> tuple[ToolCall, ...]:
+        """POST one planning turn that offers submit_plan and no file tool.
+
+        Args:
+            messages: Planning prompt in Chat Completions shape.
+
+        Returns:
+            Tool calls from the first choice. read_file, write_file, and
+            replace_text are not sent, so the model cannot name them.
+
+        Raises:
+            ValueError: The body is not a chat completion with a message.
+        """
+        self._posts += 1
+        payload: dict[str, object] = {
+            "model": self._model,
+            "messages": messages,
+            "tools": _PLAN_TOOLS,
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "submit_plan"},
+            },
+        }
         body = json.dumps(payload).encode("utf-8")
         headers = {
             "Authorization": f"Bearer {self._api_key}",
