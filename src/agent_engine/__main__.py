@@ -1,10 +1,11 @@
-"""Command line for tenant provisioning, leases, the jail, edits, and run-task.
+"""Command line for tenant provisioning, leases, the jail, edits, run-task, and demos.
 
 This module is the process edge. It parses arguments, opens one tenant
 database, and calls LeaseService for acquire, renew, and release. jail and
 replace do not take a tenant. run-task wires the loop through composition.
-The scripted self-test procedure lives in agent_engine.self_test. Invalid
-ids, tenant boundary errors, lease errors, and edit errors exit non-zero.
+demo starts the scenarios. The scripted self-test procedure lives in
+agent_engine.self_test. Invalid ids, tenant boundary errors, lease errors,
+and edit errors exit non-zero.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from agent_engine.adapters.sqlite.tenant_store import (
 from agent_engine.adapters.workspace.edits import FlatWorkspace, OptimisticEditor
 from agent_engine.application.leases import LeaseService, SystemClock
 from agent_engine.composition import format_report, run_task
+from agent_engine.demo import run_scenarios
 from agent_engine.domain.errors import (
     AmbiguousEdit,
     FenceRejected,
@@ -95,6 +97,11 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--llm", choices=("canned", "live"), default="live")
     run.add_argument("--tool-choice")
 
+    demo_cmd = sub.add_parser("demo")
+    demo_cmd.add_argument("--tenant", required=True)
+    demo_cmd.add_argument("--scenario", type=int)
+    demo_cmd.add_argument("--all", action="store_true", dest="all_scenarios")
+
     try:
         parsed = parser.parse_args(rest)
     except SystemExit as exc:
@@ -138,6 +145,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(format_report(report))
             return 0
+        if parsed.command == "demo":
+            return _run_demo(data_root, parsed)
         if parsed.command in {"acquire", "renew", "release"}:
             return _run_lease_command(data_root, tenant_id, parsed)
         print(f"unknown command {parsed.command}", file=sys.stderr)
@@ -155,6 +164,29 @@ def main(argv: list[str] | None = None) -> int:
     ) as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
+
+
+def _run_demo(data_root: Path, parsed: argparse.Namespace) -> int:
+    if parsed.tenant != "acme":
+        print("demos run as acme", file=sys.stderr)
+        return 2
+    if parsed.all_scenarios:
+        numbers: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
+        llm = "live"
+    elif parsed.scenario is None:
+        print("demo requires --scenario or --all", file=sys.stderr)
+        return 2
+    else:
+        numbers = (parsed.scenario,)
+        llm = "canned" if parsed.scenario in (4, 6) else "live"
+    try:
+        run_scenarios(data_root, numbers, llm=llm)
+    except (OSError, ValueError) as exc:
+        print("FAIL")
+        print(exc, file=sys.stderr)
+        return 1
+    print("PASS")
+    return 0
 
 
 def _take_data_root(argv: list[str]) -> tuple[Path, list[str]]:

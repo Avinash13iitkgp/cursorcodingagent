@@ -10,6 +10,7 @@ an MCP server.
 from __future__ import annotations
 
 import json
+import threading
 import urllib.request
 from typing import Protocol
 
@@ -87,6 +88,22 @@ class Transport(Protocol):
 class UrllibTransport:
     """Stdlib POST. The product worker and the live path use this class."""
 
+    def __init__(self) -> None:
+        """Remember the in-flight response so close can drop the socket."""
+        self._lock = threading.Lock()
+        self._response: object | None = None
+
+    def close(self) -> None:
+        """Close the in-flight response, if a POST is waiting on the socket.
+
+        Returns:
+            None.
+        """
+        with self._lock:
+            response = self._response
+        if response is not None:
+            response.close()  # type: ignore[attr-defined]
+
     def post(
         self, url: str, headers: dict[str, str], body: bytes, timeout_s: float
     ) -> bytes:
@@ -105,8 +122,17 @@ class UrllibTransport:
             urllib.error.URLError: The socket failed or the status is an error.
         """
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        response = urllib.request.urlopen(request, timeout=timeout_s)
+        with self._lock:
+            self._response = response
+        try:
             return response.read()
+        finally:
+            with self._lock:
+                self._response = None
+            closer = getattr(response, "close", None)
+            if closer is not None:
+                closer()
 
 
 class CannedTransport:
@@ -144,6 +170,14 @@ class CannedTransport:
             raise ValueError("canned transport has no body left")
         return json.dumps(self._bodies.pop(0)).encode("utf-8")
 
+    def close(self) -> None:
+        """No socket to close. The canned transport does not dial out.
+
+        Returns:
+            None.
+        """
+        return None
+
 
 class OpenAIChatLlm:
     """Chat Completions client. Logs redact the bearer token."""
@@ -172,6 +206,7 @@ class OpenAIChatLlm:
         self._timeout_s = timeout_s
         self._posts = 0
         self.logs: list[str] = []
+        self.tool_choice: str | None = None
 
     def post_count(self) -> int:
         """Return how many completions were requested.
@@ -194,7 +229,16 @@ class OpenAIChatLlm:
             ValueError: The body is not a chat completion with a message.
         """
         self._posts += 1
-        payload = {"model": self._model, "messages": messages, "tools": _TOOLS}
+        payload: dict[str, object] = {
+            "model": self._model,
+            "messages": messages,
+            "tools": _TOOLS,
+        }
+        if self.tool_choice:
+            payload["tool_choice"] = {
+                "type": "function",
+                "function": {"name": self.tool_choice},
+            }
         body = json.dumps(payload).encode("utf-8")
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -214,6 +258,16 @@ class OpenAIChatLlm:
         if self._api_key and self._api_key in decoded:
             decoded = decoded.replace(self._api_key, "[redacted]")
         self.logs.append(text + decoded)
+
+    def close(self) -> None:
+        """Close the transport socket when a lost lease must not start another POST.
+
+        Returns:
+            None.
+        """
+        closer = getattr(self._transport, "close", None)
+        if closer is not None:
+            closer()
 
 
 def _parse_calls(raw: bytes) -> tuple[ToolCall, ...]:

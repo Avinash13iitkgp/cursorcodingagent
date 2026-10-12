@@ -337,12 +337,13 @@ class SqliteStepStore:
             idempotency_key: SHA256 key.
 
         Returns:
-            result_json, or None when this file has no row.
+            result_json, or None when this file has no committed row.
+            A rolled_back row is not a hit.
         """
         row = self._connection.execute(
             """
             SELECT result_json FROM idempotency_cache
-            WHERE tenant_id = ? AND idempotency_key = ?
+            WHERE tenant_id = ? AND idempotency_key = ? AND status = 'committed'
             """,
             (tenant_id.value, idempotency_key),
         ).fetchone()

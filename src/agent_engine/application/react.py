@@ -127,12 +127,17 @@ class ReactLoop:
         self._gate = gate
         self._instant = lambda: 0.0
 
-    def run(self, now: float, *, clock: Clock | None = None) -> RunResult:
+    def run(
+        self, now: float, *, clock: Clock | None = None, resume_only: bool = False
+    ) -> RunResult:
         """Drive steps until a terminal status, an empty model turn, or 8 steps.
 
         Args:
             now: Instant compared with lease_expires_at when clock is omitted.
             A clock supplies a fresh instant for each fenced write.
+            resume_only: After the open intent is executed, return without
+                another model call. The successor uses this so a crashed step
+                is committed once.
 
         Returns:
             The task status, whether this run was a cache hit, how many tools
@@ -152,7 +157,7 @@ class ReactLoop:
                 executions += 1
                 self._execute(open_step)
                 status = self._store.task_status(self._tenant_id, self._task_id)
-                if status in _TERMINAL:
+                if status in _TERMINAL or resume_only:
                     return self._result(status, False, executions)
                 continue
             status = self._store.task_status(self._tenant_id, self._task_id)

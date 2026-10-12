@@ -1,10 +1,10 @@
 """Wiring root for one run-task process.
 
-This module opens the tenant database, the plain workspace, the jail, the
-verifier, and the LLM. application/ does not import it. A live command reads
-the tenant's llm_api_key_env and fails at startup when that variable, the
-base URL, or the model name is missing. --llm canned uses a scripted
-transport and does not read the secret.
+This module opens the tenant database, the copy-on-write workspace, the jail,
+the verifier, and the LLM. application/ does not import it. A live command
+reads the tenant's llm_api_key_env and fails at startup when that variable,
+the base URL, or the model name is missing. --llm canned uses a scripted
+transport and does not read the secret. Model-backed leases last 180 seconds.
 """
 
 from __future__ import annotations
@@ -28,8 +28,8 @@ from agent_engine.adapters.sqlite.lease_store import SqliteLeaseStore
 from agent_engine.adapters.sqlite.step_store import SqliteStepStore
 from agent_engine.adapters.sqlite.tenant_store import get_task, read_tenant
 from agent_engine.adapters.verifier.external import ExternalVerifier
+from agent_engine.adapters.workspace.cow import CowWorkspace
 from agent_engine.adapters.workspace.edits import OptimisticEditor
-from agent_engine.adapters.workspace.plain import PlainWorkspace
 from agent_engine.application.leases import LeaseService, SystemClock
 from agent_engine.application.react import ReactLoop, RunResult
 from agent_engine.application.verify_gate import VerifyGate
@@ -37,7 +37,7 @@ from agent_engine.domain.errors import FenceRejected
 from agent_engine.domain.models import TenantId
 
 _TERMINAL = ("completed", "rejected")
-_TTL = 3600.0
+_TTL = 180.0
 
 
 def format_report(report: RunResult) -> str:
@@ -87,9 +87,13 @@ def run_task(
         LeaseNotHeld: Another worker holds an unexpired lease.
     """
     task = get_task(data_root, tenant_id, task_id)
-    work = resolve_tenant_dir(data_root, tenant_id) / task.workspace_root
+    task_dir = resolve_tenant_dir(data_root, tenant_id) / task.workspace_root
+    workspace = CowWorkspace(task_dir)
+    if (task_dir / "base").is_dir() and not (workspace.work_root / "adder.py").exists():
+        workspace.seed()
+    work = workspace.work_root
     if task.status in _TERMINAL:
-        PlainWorkspace(work).cleanup_tmp()
+        workspace.cleanup_tmp()
         return RunResult(task.status, True, 0, 0)
     connection = open_tenant_db(data_root, tenant_id)
     try:
@@ -109,7 +113,7 @@ def run_task(
                 work,
                 store,
                 model,
-                PlainWorkspace(work),
+                workspace,
                 OptimisticEditor(),
                 checks,
                 VerifyGate(

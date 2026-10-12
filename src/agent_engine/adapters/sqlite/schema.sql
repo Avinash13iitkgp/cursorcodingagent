@@ -31,12 +31,13 @@ CREATE TABLE step_intents (
   PRIMARY KEY (tenant_id, task_id, step_index)
 );
 
--- Result cache keyed by the SHA256 idempotency key inside this tenant file.
+-- Result cache keyed by the SHA256 idempotency key inside this tenant file. Rollback sets status to rolled_back.
 CREATE TABLE idempotency_cache (
   tenant_id TEXT NOT NULL,
   idempotency_key TEXT NOT NULL,
   result_json TEXT NOT NULL,
   result_sha256 TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'committed' CHECK (status IN ('committed', 'rolled_back')),
   PRIMARY KEY (tenant_id, idempotency_key)
 );
 

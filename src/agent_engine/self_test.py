@@ -2,8 +2,9 @@
 
 This module owns the fixed tenants, task id, worker ids, timestamps, the
 jail and edit checks, and the canned ReAct procedure for steps 1 through 4.
-It is not the product command path. A failed check raises. run_self_test
-turns that into PASS or FAIL. --live on step 4 calls the real model.
+Step 5 delegates to the demos. It is not the product command path. A failed
+check raises. run_self_test turns that into PASS or FAIL. --live on step 4
+or step 5 calls the real model.
 """
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ def run_self_test(
         data_root: Directory that contains tenants/. The procedure writes there.
         step: A single step number. Ignored as an upper bound when through is set.
         through: Run steps 1 through this number. Those procedures stay offline.
-        live: When step 4 is selected by itself, call the real model.
+        live: When step 4 or step 5 is selected by itself, call the real model.
 
     Returns:
         0 when the procedure prints PASS. 1 when it prints FAIL.
@@ -59,12 +60,12 @@ def run_self_test(
         print("self-test requires --step or --through", file=sys.stderr)
         return 1
     if through is not None:
-        if through < 1 or through > 4 or (step is not None and (step < 1 or step > through)):
+        if through < 1 or through > 5 or (step is not None and (step < 1 or step > through)):
             print("FAIL")
             print(f"step {through} is not implemented", file=sys.stderr)
             return 1
         steps = range(1, through + 1)
-    elif step not in (1, 2, 3, 4):
+    elif step not in (1, 2, 3, 4, 5):
         print("FAIL")
         print(f"step {step} is not implemented", file=sys.stderr)
         return 1
@@ -78,8 +79,10 @@ def run_self_test(
                 _run_step2(data_root)
             elif number == 3:
                 _run_step3(data_root)
-            else:
+            elif number == 4:
                 _run_step4(data_root, live=live and through is None)
+            else:
+                _run_step5(data_root, live=live and through is None)
     except (
         UnknownTenant,
         TenantMismatch,
@@ -271,6 +274,22 @@ def _run_step4(data_root: Path, *, live: bool) -> None:
         raise OSError("forced finish changed the broken adder")
 
 
+def _run_step5(data_root: Path, *, live: bool) -> None:
+    """Run the offline suspend and rollback demos, or the live demos.
+
+    Args:
+        data_root: Directory that contains tenants/.
+        live: When true, run scenarios 1, 2, 3, and 5 against the real model.
+            Otherwise run scenarios 4 and 6 on this machine.
+    """
+    from agent_engine.demo import run_scenarios
+
+    if live:
+        run_scenarios(data_root, (1, 2, 3, 5), llm="live")
+    else:
+        run_scenarios(data_root, (4, 6), llm="canned")
+
+
 def _prepare_tenant(data_root: Path, tenant: str) -> None:
     provision(data_root, TenantId(tenant), tenant.capitalize())
 
@@ -279,16 +298,22 @@ def _prepare_adder(data_root: Path, tenant: str, task_id: str) -> Path:
     _prepare_tenant(data_root, tenant)
     init_task(data_root, TenantId(tenant), task_id)
     work = data_root / "tenants" / tenant / "tasks" / task_id
-    work.mkdir(parents=True, exist_ok=True)
+    base = work / "base"
+    base.mkdir(parents=True, exist_ok=True)
     fixture = Path(__file__).resolve().parents[2] / "fixtures" / "broken_adder"
-    shutil.copyfile(fixture / "adder.py", work / "adder.py")
+    if not (base / "adder.py").exists():
+        shutil.copyfile(fixture / "adder.py", base / "adder.py")
+    from agent_engine.adapters.workspace.cow import CowWorkspace
+
+    CowWorkspace(work).seed()
+    tree = work / "work"
     checks = data_root / "checks"
     checks.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(fixture / "test_adder.py", checks / "test_adder.py")
-    copied = work / "test_adder.py"
+    copied = tree / "test_adder.py"
     if copied.exists():
         copied.unlink()
-    return work
+    return tree
 
 
 def _step_count(data_root: Path, tenant: str) -> int:

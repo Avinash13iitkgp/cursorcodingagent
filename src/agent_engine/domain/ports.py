@@ -270,6 +270,21 @@ class Workspace(Protocol):
         """
         ...  # pragma: no cover
 
+    def remove_file(self, relative_path: str) -> None:
+        """Remove one work-tree file. Copy-on-write records a tombstone.
+
+        Args:
+            relative_path: Path relative to the work root.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: The path escapes the work root.
+            FileNotFoundError: The file does not exist.
+        """
+        ...  # pragma: no cover
+
 
 class Editor(Protocol):
     """Optimistic edits. The loop calls this port and does not hash files itself."""
