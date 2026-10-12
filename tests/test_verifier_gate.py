@@ -83,6 +83,22 @@ def test_verifier_child_env_has_no_api_key(tmp_path: Path, monkeypatch: pytest.M
     assert sentinel not in stderr
 
 
+def test_relative_checks_dir_is_found_from_the_work_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative checks path is resolved before the jail cwd becomes the work tree."""
+    _install_checks(tmp_path)
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "adder.py").write_text(
+        "def add(a: int, b: int) -> int:\n    return a + b\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    ok, _stdout, stderr = ExternalVerifier(Path("checks"), Jail()).run(work)
+    assert ok, stderr
+
+
 def test_verifier_timeout_is_a_failed_result(tmp_path: Path) -> None:
     """A jailed timeout is a failed check and does not escape as an uncaught error."""
     checks = tmp_path / "checks"

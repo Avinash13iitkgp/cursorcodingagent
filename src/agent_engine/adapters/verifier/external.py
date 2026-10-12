@@ -3,7 +3,8 @@
 The command list is checks/commands, one argv per line, outside the writable
 work tree. When that file is absent the Python fixture is the default list:
 python -m compileall on the work tree, then python -m unittest on the check
-file. That fixture is the default, not the only language. The child
+file. The check directory is absolute because the child cwd is the work root.
+That fixture is the default, not the only language. The child
 environment is PATH plus PYTHONPATH pointed at the work tree. A missing
 compiler is a failed result. This module does not read the transcript and
 does not write tasks.status.
@@ -88,7 +89,7 @@ class ExternalVerifier:
                 "unittest",
                 "discover",
                 "-s",
-                str(self._checks_dir),
+                str(self._checks_dir.resolve()),
                 "-p",
                 "test_adder.py",
             ],
