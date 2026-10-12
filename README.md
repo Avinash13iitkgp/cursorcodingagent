@@ -2,7 +2,7 @@
 
 Local, multi-process coding-agent engine. Each tenant has its own SQLite database and workspace directory. A fencing token makes a stale worker unable to commit. The worker calls an OpenAI-compatible Chat Completions API with a token you provide.
 
-The build is five steps, specified in [plan.md](plan.md). Do not start a step until the previous step's pytest gate and `self-test` gate both pass. This guide is the setup and test map. Commands below are the interface those steps implement; a command is usable once its step has landed.
+The build is five steps, specified in [plan.md](plan.md). Do not start a step until the previous step's pytest gate and `self-test` gate both pass. This guide is the setup and test map. Step 1 is implemented: `provision`, `init-task`, `pragma`, and `self-test --step 1`. Steps 2 through 5 stay specified in `plan.md`, and their commands are added as those steps land.
 
 ## Requirements
 
