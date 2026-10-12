@@ -1,6 +1,7 @@
 .venv/
 var/
 .env
+scripts/setup.sh
 __pycache__/
 .pytest_cache/
 .coverage
