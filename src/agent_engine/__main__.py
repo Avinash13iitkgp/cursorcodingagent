@@ -4,8 +4,10 @@ This module is the process edge. It parses arguments, opens one tenant
 database, and calls LeaseService for acquire, renew, and release. jail and
 replace do not take a tenant. run-task wires the loop through composition.
 plan stores a proposed tree for a prompt, accept marks it accepted, show-plan
-prints it, and apply runs the loop only after that accept. demo starts the
-scenarios. The scripted self-test procedure lives in agent_engine.self_test.
+prints it, and apply runs the loop only after that accept. new is those four
+in one command: it provisions the tenant, names the task after the prompt,
+prints the tree, and waits for a yes on stdin before it builds anything.
+demo starts the scenarios. The scripted self-test procedure lives in agent_engine.self_test.
 Invalid ids, tenant boundary errors, lease errors, a plan that is not
 accepted, and edit errors exit non-zero.
 """
@@ -35,6 +37,7 @@ from agent_engine.composition import (
     propose_plan,
     run_task,
     show_plan,
+    start_project,
 )
 from agent_engine.demo import run_scenarios
 from agent_engine.domain.errors import (
@@ -106,6 +109,17 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--llm", choices=("canned", "live"), default="live")
     run.add_argument("--tool-choice")
 
+    new_cmd = sub.add_parser("new")
+    new_cmd.add_argument("prompt")
+    new_cmd.add_argument("--tenant", default="acme")
+    new_cmd.add_argument("--display-name", default="")
+    new_cmd.add_argument("--task", default="")
+    new_cmd.add_argument("--llm", choices=("canned", "live"), default="live")
+    new_cmd.add_argument("--max-steps", type=int, default=32)
+    new_cmd.add_argument("--checks-cmd", action="append", default=[])
+    new_cmd.add_argument("--yes", action="store_true")
+    new_cmd.add_argument("--plan-only", action="store_true")
+
     plan_cmd = sub.add_parser("plan")
     plan_cmd.add_argument("--tenant", required=True)
     plan_cmd.add_argument("--task", required=True)
@@ -175,6 +189,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(format_report(report))
             return 0
+        if parsed.command == "new":
+            return _run_new(data_root, tenant_id, parsed)
         if parsed.command in {"plan", "accept", "show-plan", "apply"}:
             return _run_plan_command(data_root, tenant_id, parsed)
         if parsed.command == "demo":
@@ -196,6 +212,63 @@ def main(argv: list[str] | None = None) -> int:
     ) as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
+
+
+def _run_new(data_root: Path, tenant_id: TenantId, parsed: argparse.Namespace) -> int:
+    checks = tuple(parsed.checks_cmd) or (f"{sys.executable} -m pytest -q",)
+    result = start_project(
+        data_root,
+        tenant_id,
+        parsed.prompt,
+        task_id=parsed.task,
+        display_name=parsed.display_name,
+        llm=parsed.llm,
+        max_steps=parsed.max_steps,
+        checks_cmd=checks,
+        confirm=_plan_answer(parsed),
+    )
+    print(f"task={result.task_id}")
+    where = f"--data-root {data_root} --tenant {tenant_id.value} --task {result.task_id}"
+    if not result.accepted or result.report is None:
+        print("plan is proposed. build it with:")
+        print(f"  agent accept {where}")
+        print(f"  agent apply {where}")
+        return 0
+    print(f"status={result.report.status}")
+    print(f"work={result.work_root}")
+    if result.report.status not in ("completed", "rejected"):
+        print("the loop stopped before finish. resume with:")
+        print(f"  agent apply {where}")
+    return 0
+
+
+def _plan_answer(parsed: argparse.Namespace):  # type: ignore[no-untyped-def]
+    if parsed.plan_only:
+        return _print_plan
+    if parsed.yes:
+        return _accept_plan
+    return _ask_plan
+
+
+def _print_plan(tree: str) -> bool:
+    print(tree)
+    return False
+
+
+def _accept_plan(tree: str) -> bool:
+    print(tree)
+    return True
+
+
+def _ask_plan(tree: str) -> bool:
+    print(tree)
+    if not sys.stdin.isatty():
+        print("stdin is not a terminal. pass --yes or --plan-only", file=sys.stderr)
+        return False
+    return input("accept this plan and build the tree? [y/N] ").strip().lower() in {
+        "y",
+        "yes",
+    }
 
 
 def _run_plan_command(

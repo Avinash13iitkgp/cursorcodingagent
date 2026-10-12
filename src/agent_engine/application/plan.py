@@ -12,6 +12,7 @@ sqlite or adapters.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -19,6 +20,8 @@ from typing import Protocol
 from agent_engine.domain.models import ToolCall
 
 _ACTIONS = ("create", "edit")
+_SLUG_WORD = re.compile(r"[a-z0-9]+")
+_SLUG_CHARS = 40
 _PLAN_RULES = (
     "Plan the work tree for the user prompt. Call submit_plan once. List every "
     "file path from the work root down, including nested packages and test "
@@ -238,6 +241,32 @@ def apply_prompt(prompt: str) -> str:
         "read_file for a path that already exists. Call run_checks and finish "
         "when the tree is written. Do not modify checks."
     )
+
+
+def task_slug(prompt: str) -> str:
+    """Derive a task id from a prompt.
+
+    Args:
+        prompt: User sentence. Only letters and digits are kept.
+
+    Returns:
+        A lowercase slug of at most 40 characters that matches the task id
+        shape. Whole words are kept, so the caller can add a suffix.
+
+    Raises:
+        ValueError: The prompt has no letter or digit.
+    """
+    words = _SLUG_WORD.findall(prompt.lower())
+    if not words:
+        raise ValueError("prompt has no word to name a task")
+    parts: list[str] = [words[0][:_SLUG_CHARS]]
+    length = len(parts[0])
+    for word in words[1:]:
+        if length + 1 + len(word) > _SLUG_CHARS:
+            break
+        parts.append(word)
+        length += 1 + len(word)
+    return "-".join(parts)
 
 
 def _draw(node: dict[str, dict[str, object]], depth: int, lines: list[str]) -> None:

@@ -166,9 +166,19 @@ Each entry has `name`, `argv`, and an optional `env` list of variable names. The
 
 `self-test --step 7` runs canned `search_text`, `remember`, and `read_file` on task `context-demo`, then replays that task with a small `context_token_budget`.
 
+### One command for a new project
+
+`agent new PROMPT` is `provision`, `init-task`, `plan`, `accept`, and `apply` in one step. The install puts `agent` on the path, so no `python -m` prefix is needed.
+
+```bash
+agent --data-root /tmp/my-project new 'Build a FastAPI service with a health endpoint and pytest tests.'
+```
+
+It provisions tenant `acme`, names the task after the prompt, prints the tree, and waits for a `y` on stdin before it writes anything. `--yes` skips that question, `--plan-only` stops after the plan, and `--task` names the task instead of using the slug. A slug that is taken gets a numeric suffix, so the same prompt twice is two tasks. The default check command is this interpreter plus `-m pytest -q`, which avoids a `python` that is not on the jailed `PATH`; `--checks-cmd` overrides it and may be repeated. `--llm canned` runs the whole flow offline. The last lines print the task id, the status, and the work root, plus the `agent apply` line to resume when the loop stopped before `finish`.
+
 ### Prompt, plan, then build a tree
 
-`run-task` and the demos keep the adder prompt. A new project starts from a prompt instead. `plan` makes one model call whose only tool is `submit_plan`, so that call cannot return a file tool. It stores the file list as `proposed` and writes nothing in the work tree. `accept` marks that row `accepted` with no model call and no file write. `apply` refuses a plan that is not accepted, then runs the ReAct loop with the prompt and the accepted plan pinned in the pack. `show-plan` prints the stored prompt, status, and tree.
+The four commands behind `new` are also separate, which is what you want when a human reviews the plan between steps. `run-task` and the demos keep the adder prompt. A new project starts from a prompt instead. `plan` makes one model call whose only tool is `submit_plan`, so that call cannot return a file tool. It stores the file list as `proposed` and writes nothing in the work tree. `accept` marks that row `accepted` with no model call and no file write. `apply` refuses a plan that is not accepted, then runs the ReAct loop with the prompt and the accepted plan pinned in the pack. `show-plan` prints the stored prompt, status, and tree.
 
 ```bash
 python -m agent_engine --data-root /tmp/agent-plan plan --tenant acme --task api-tree --prompt 'Build a small api package with tests.'
@@ -273,6 +283,7 @@ That count is `0`.
 | Compare-and-swap a file | `replace --root ... --expected-sha256 ...` |
 | Run offline | `run-task --llm canned` |
 | Run against your token | `run-task` with the three env vars set |
+| Start a project in one command | `agent new 'Build a ...'` |
 | Plan a tree for a prompt | `plan --tenant acme --task api-tree --prompt '...'` |
 | Read the stored plan | `show-plan --tenant acme --task api-tree` |
 | Accept a plan | `accept --tenant acme --task api-tree` |
@@ -284,4 +295,4 @@ That count is `0`.
 | Search, remember, and summarize | `self-test --step 7` |
 | All six demos | `demo --tenant acme --all` |
 
-Prefix tenant commands with `--data-root` when you are not using `./var`.
+Prefix tenant commands with `--data-root` when you are not using `./var`. Every command runs as `agent ...` after the editable install, or as `python -m agent_engine ...` without it.

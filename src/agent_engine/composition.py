@@ -7,7 +7,9 @@ the base URL, or the model name is missing. --llm canned uses a scripted
 transport and does not read the secret. Model-backed leases last 180 seconds.
 propose_plan takes no lease and writes no file. accept_plan calls no model.
 apply_plan refuses a plan that is not accepted, writes the operator check
-commands, then runs the loop with that plan pinned in the pack.
+commands, then runs the loop with that plan pinned in the pack. start_project
+chains those calls for one prompt and asks the caller's confirm before the
+accept, so a declined plan still writes nothing.
 """
 
 from __future__ import annotations
@@ -17,6 +19,8 @@ import json
 import os
 import time
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from agent_engine.adapters.exec.jail import Jail
@@ -33,7 +37,12 @@ from agent_engine.adapters.sqlite.db import open_tenant_db, resolve_tenant_dir
 from agent_engine.adapters.sqlite.lease_store import SqliteLeaseStore
 from agent_engine.adapters.sqlite.plan_store import SqlitePlanStore
 from agent_engine.adapters.sqlite.step_store import SqliteStepStore
-from agent_engine.adapters.sqlite.tenant_store import get_task, read_tenant
+from agent_engine.adapters.sqlite.tenant_store import (
+    get_task,
+    init_task,
+    provision,
+    read_tenant,
+)
 from agent_engine.adapters.verifier.external import ExternalVerifier
 from agent_engine.adapters.workspace.cow import CowWorkspace
 from agent_engine.adapters.workspace.edits import OptimisticEditor
@@ -45,10 +54,11 @@ from agent_engine.application.plan import (
     pinned_plan,
     plan_body,
     render_tree,
+    task_slug,
 )
 from agent_engine.application.react import ReactLoop, RunResult
 from agent_engine.application.verify_gate import VerifyGate
-from agent_engine.domain.errors import FenceRejected
+from agent_engine.domain.errors import FenceRejected, TaskNotFound
 from agent_engine.domain.models import TenantId
 
 _TERMINAL = ("completed", "rejected")
@@ -72,6 +82,17 @@ _CANNED_TEST = (
     "def test_add() -> None:\n"
     "    assert add(1, 2) == 3\n"
 )
+
+
+@dataclass(frozen=True)
+class ProjectResult:
+    """What one start_project call stored, built, and left on disk."""
+
+    task_id: str
+    tree: str
+    accepted: bool
+    work_root: Path
+    report: RunResult | None
 
 
 def format_report(report: RunResult) -> str:
@@ -350,6 +371,76 @@ def apply_plan(
         plan_text=pinned_plan(plan),
         max_steps=max_steps,
     )
+
+
+def start_project(
+    data_root: Path,
+    tenant_id: TenantId,
+    prompt: str,
+    *,
+    task_id: str = "",
+    display_name: str = "",
+    llm: str = "live",
+    max_steps: int = 32,
+    checks_cmd: tuple[str, ...] = (),
+    confirm: Callable[[str], bool] | None = None,
+) -> ProjectResult:
+    """Provision, plan, confirm, accept, and apply in one call.
+
+    Args:
+        data_root: Directory that contains tenants/ and checks/. It is created
+            when it does not exist.
+        tenant_id: Tenant to provision or reuse.
+        prompt: User sentence the model plans for.
+        task_id: Task to create. An empty value names the task after the
+            prompt and adds a numeric suffix when that id is taken.
+        display_name: Tenant display name. Empty uses the tenant id.
+        llm: canned returns the fixed plan and tree. Any other value is live.
+        max_steps: Agent steps one apply may reach.
+        checks_cmd: Operator commands written before the loop. The model does
+            not choose them and cannot write that directory.
+        confirm: Called with the tree before accept. None accepts without
+            asking. A false answer leaves the plan proposed and writes no file.
+
+    Returns:
+        The task id, the tree, whether the plan was accepted, the work root,
+        and the loop result. The result is None when the plan was not accepted.
+
+    Raises:
+        TenantMismatch: The resolved path leaves the data root.
+        ValueError: The prompt has no word for a task id, a live run is
+            missing its credentials, or the model did not submit a valid plan.
+        LeaseNotHeld: Another worker holds an unexpired lease.
+    """
+    provision(data_root, tenant_id, display_name or tenant_id.value)
+    chosen = task_id or _free_task(data_root, tenant_id, task_slug(prompt))
+    init_task(data_root, tenant_id, chosen)
+    tree = propose_plan(data_root, tenant_id, chosen, prompt, llm=llm)
+    work_root = resolve_tenant_dir(data_root, tenant_id) / "tasks" / chosen / "work"
+    if confirm is not None and not confirm(tree):
+        return ProjectResult(chosen, tree, False, work_root, None)
+    accept_plan(data_root, tenant_id, chosen)
+    report = apply_plan(
+        data_root,
+        tenant_id,
+        chosen,
+        llm=llm,
+        max_steps=max_steps,
+        checks_cmd=checks_cmd,
+    )
+    return ProjectResult(chosen, tree, True, work_root, report)
+
+
+def _free_task(data_root: Path, tenant_id: TenantId, base: str) -> str:
+    candidate = base
+    suffix = 2
+    while True:
+        try:
+            get_task(data_root, tenant_id, candidate)
+        except TaskNotFound:
+            return candidate
+        candidate = f"{base}-{suffix}"
+        suffix += 1
 
 
 def _read_plan(data_root: Path, tenant_id: TenantId, task_id: str) -> tuple[str, str, str]:

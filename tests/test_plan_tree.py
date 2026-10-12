@@ -16,8 +16,10 @@ from agent_engine.application.plan import (
     pinned_plan,
     plan_body,
     render_tree,
+    task_slug,
     validate_plan,
 )
+from agent_engine.composition import start_project
 from agent_engine.domain.models import TenantId, ToolCall
 from step4_support import NOW, FixedChecks, ScriptedLlm, StatusGate, call, lease_task, loop
 
@@ -111,6 +113,95 @@ def test_plan_refuses_a_second_proposal_after_accept(
     capsys.readouterr()
     assert _cli(tmp_path, "plan", "--prompt", PROMPT, "--llm", "canned") == 1
     assert "already accepted" in capsys.readouterr().err
+
+
+def test_new_provisions_plans_and_builds_in_one_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """new --yes names the task after the prompt and writes the tree."""
+    code = main(
+        [
+            "--data-root",
+            str(tmp_path),
+            "new",
+            PROMPT,
+            "--llm",
+            "canned",
+            "--yes",
+            "--checks-cmd",
+            "python -m pytest -q",
+        ]
+    )
+    printed = capsys.readouterr().out
+    assert code == 0
+    slug = "build-a-small-api-package-with-tests"
+    assert f"task={slug}" in printed
+    assert "status=running" in printed
+    assert "services/" in printed
+    work = tmp_path / "tenants" / "acme" / "tasks" / slug / "work"
+    assert (work / APP).is_file()
+    assert (work / TEST).is_file()
+    assert (tmp_path / "checks" / "commands").read_text(encoding="utf-8") == (
+        "python -m pytest -q\n"
+    )
+
+
+def test_new_without_a_yes_leaves_the_plan_proposed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A declined plan is stored, prints how to resume, and writes no file."""
+    base = ["--data-root", str(tmp_path), "new", PROMPT, "--llm", "canned"]
+    assert main([*base, "--plan-only"]) == 0
+    printed = capsys.readouterr().out
+    assert "plan is proposed" in printed
+    assert "agent accept" in printed
+    slug = "build-a-small-api-package-with-tests"
+    work = tmp_path / "tenants" / "acme" / "tasks" / slug / "work"
+    assert not work.is_dir() or list(work.rglob("*")) == []
+    assert not (tmp_path / "checks" / "commands").exists()
+    assert main([*base, "--yes"]) == 0
+    assert f"task={slug}-2" in capsys.readouterr().out
+
+
+def test_start_project_takes_an_explicit_task_and_a_refusal(tmp_path: Path) -> None:
+    """A named task is used as given, and a false confirm writes nothing."""
+    refused = start_project(
+        tmp_path,
+        TenantId("acme"),
+        PROMPT,
+        task_id=TASK,
+        llm="canned",
+        confirm=lambda tree: False,
+    )
+    assert refused.task_id == TASK
+    assert refused.accepted is False
+    assert refused.report is None
+    assert "app.py" in refused.tree
+    assert _work_files(tmp_path) == []
+    built = start_project(
+        tmp_path,
+        TenantId("acme"),
+        PROMPT,
+        task_id=TASK,
+        llm="canned",
+        checks_cmd=("python -m pytest -q",),
+    )
+    assert built.accepted is True
+    assert built.report is not None
+    assert built.work_root == _work_root(tmp_path)
+    assert _work_files(tmp_path) == [APP, TEST]
+
+
+def test_task_slug_keeps_whole_words_and_needs_one_word() -> None:
+    """The slug is a short lowercase id built from the prompt words."""
+    assert task_slug("Build a FastAPI service!") == "build-a-fastapi-service"
+    assert task_slug("  Add   health  endpoint  ") == "add-health-endpoint"
+    long = task_slug("build an extremely detailed inventory reporting service today")
+    assert len(long) <= 40
+    assert not long.endswith("-")
+    assert task_slug("x" * 60) == "x" * 40
+    with pytest.raises(ValueError):
+        task_slug("!!! ???")
 
 
 def test_write_file_jails_the_path_and_keeps_an_existing_file(tmp_path: Path) -> None:
