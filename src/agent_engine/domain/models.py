@@ -1,7 +1,8 @@
 """Frozen domain values. This module performs no I/O.
 
-Types: TenantId, Tenant, Task, Lease, TextEdit, and EditResult. Constructing
-them does not touch the filesystem or SQLite. Invalid tenant ids raise ValueError.
+Types: TenantId, Tenant, Task, Lease, TextEdit, EditResult, ToolCall, and
+StepView. Constructing them does not touch the filesystem or SQLite. Invalid
+tenant ids raise ValueError.
 """
 
 from __future__ import annotations
@@ -90,3 +91,24 @@ class EditResult:
     """Outcome of an edit that changed nothing after the check, or wrote the new bytes."""
 
     status: Literal["applied", "already_applied"]
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """One tool call from a model message. arguments_json is the model's object."""
+
+    name: str
+    arguments_json: str
+    call_id: str
+
+
+@dataclass(frozen=True)
+class StepView:
+    """One agent step row. commit_marker rows are not represented here."""
+
+    step_index: int
+    idempotency_key: str
+    tool_name: str
+    args_json: str
+    status: str
+    result_json: str | None

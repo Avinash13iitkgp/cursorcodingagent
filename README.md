@@ -2,7 +2,7 @@
 
 Local, multi-process coding-agent engine. Each tenant has its own SQLite database and workspace directory. A fencing token makes a stale worker unable to commit. The worker calls an OpenAI-compatible Chat Completions API with a token you provide.
 
-The build is six steps, specified in [plan.md](plan.md). Do not start a step until the previous step's pytest gate and `self-test` gate both pass. This guide is the setup and test map. Steps 1 through 3 are implemented: `provision`, `init-task`, `pragma`, `acquire`, `renew`, `release`, `show-lease`, `jail`, `replace`, and `self-test` through step 3. Steps 4 through 6 stay specified in `plan.md`. Step 6 is MCP tool calls.
+The build is six steps, specified in [plan.md](plan.md). Do not start a step until the previous step's pytest gate and `self-test` gate both pass. This guide is the setup and test map. Steps 1 through 4 are implemented: `provision`, `init-task`, `pragma`, `acquire`, `renew`, `release`, `show-lease`, `jail`, `replace`, `run-task`, and `self-test` through step 4. Steps 5 and 6 stay specified in `plan.md`. Step 6 is MCP tool calls.
 
 ## Requirements
 
@@ -112,6 +112,14 @@ The jail starts a new session and, on timeout, kills the process group. That com
 
 ## 7. Run a task
 
+`self-test --step 4` is the canned procedure: it prints `completed`, then a cache hit with zero executions and zero posts. `self-test --step 4 --live` calls the real model and exits non-zero when `AGENT_LLM_API_KEY` is unset. `--llm canned` does not need a token. The default `run-task` is the live adapter.
+
+```bash
+python -m agent_engine self-test --step 4 --data-root /tmp/agent-step4
+python -m agent_engine self-test --through 4 --data-root /tmp/agent-step4
+python -m agent_engine self-test --step 4 --live --data-root /tmp/agent-step4-live
+```
+
 Canned model, no network:
 
 ```bash
@@ -124,7 +132,7 @@ Live model:
 python -m agent_engine --data-root /tmp/agent-demo run-task --tenant acme --task fix-adder-live
 ```
 
-`completed` is written only after the external verifier passes. A `finish` tool call from the model does not set that status by itself.
+`completed` is written only after the external verifier passes. A `finish` tool call from the model does not set that status by itself. The verifier runs `checks/commands` in the jail. The Python fixture compiles the work tree and runs `checks/test_adder.py` with `PYTHONPATH` pointed at that tree.
 
 ## 8. CLI test gates
 

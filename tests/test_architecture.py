@@ -63,11 +63,22 @@ def test_models_are_frozen() -> None:
         )
 
 
+def test_application_import_ban() -> None:
+    """application/ does not import sqlite3, subprocess, os.killpg, or adapters."""
+    root = Path(__file__).resolve().parents[1] / "src" / "agent_engine" / "application"
+    _scan_imports(root)
+
+
 def test_domain_imports_neither_sqlite_nor_adapters() -> None:
     """domain/ and application/ do not import sqlite3, subprocess, os.killpg, or adapters."""
     root = Path(__file__).resolve().parents[1] / "src" / "agent_engine"
+    _scan_imports(root / "domain")
+    _scan_imports(root / "application")
+
+
+def _scan_imports(directory: Path) -> None:
     banned_roots = {"sqlite3", "subprocess"}
-    for path in (*root.joinpath("domain").rglob("*.py"), *root.joinpath("application").rglob("*.py")):
+    for path in directory.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):

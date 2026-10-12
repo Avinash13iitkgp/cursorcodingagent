@@ -1,10 +1,10 @@
-"""Command line for tenant provisioning, leases, the jail, and edits.
+"""Command line for tenant provisioning, leases, the jail, edits, and run-task.
 
 This module is the process edge. It parses arguments, opens one tenant
 database, and calls LeaseService for acquire, renew, and release. jail and
-replace do not take a tenant. The scripted self-test procedure lives in
-agent_engine.self_test. Invalid ids, tenant boundary errors, lease errors,
-and edit errors exit non-zero.
+replace do not take a tenant. run-task wires the loop through composition.
+The scripted self-test procedure lives in agent_engine.self_test. Invalid
+ids, tenant boundary errors, lease errors, and edit errors exit non-zero.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from agent_engine.adapters.sqlite.tenant_store import (
 )
 from agent_engine.adapters.workspace.edits import FlatWorkspace, OptimisticEditor
 from agent_engine.application.leases import LeaseService, SystemClock
+from agent_engine.composition import format_report, run_task
 from agent_engine.domain.errors import (
     AmbiguousEdit,
     FenceRejected,
@@ -88,6 +89,12 @@ def main(argv: list[str] | None = None) -> int:
     replace_cmd.add_argument("--old", required=True)
     replace_cmd.add_argument("--new", required=True)
 
+    run = sub.add_parser("run-task")
+    run.add_argument("--tenant", required=True)
+    run.add_argument("--task", required=True)
+    run.add_argument("--llm", choices=("canned", "live"), default="live")
+    run.add_argument("--tool-choice")
+
     try:
         parsed = parser.parse_args(rest)
     except SystemExit as exc:
@@ -97,7 +104,9 @@ def main(argv: list[str] | None = None) -> int:
             live_status = _missing_token_if_live(parsed.live)
             if live_status != 0:
                 return live_status
-            return run_self_test(data_root, parsed.step, parsed.through)
+            return run_self_test(
+                data_root, parsed.step, parsed.through, live=parsed.live
+            )
         if parsed.command == "jail":
             return _run_jail(parsed)
         if parsed.command == "replace":
@@ -118,6 +127,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if parsed.command == "show-lease":
             _print_lease(get_task(data_root, tenant_id, parsed.task))
+            return 0
+        if parsed.command == "run-task":
+            report = run_task(
+                data_root,
+                tenant_id,
+                parsed.task,
+                llm=parsed.llm,
+                tool_choice=parsed.tool_choice,
+            )
+            print(format_report(report))
             return 0
         if parsed.command in {"acquire", "renew", "release"}:
             return _run_lease_command(data_root, tenant_id, parsed)

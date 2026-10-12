@@ -2,7 +2,7 @@
 
 The prototype is a single-machine, multi-process engine. Each tenant has its own SQLite file and workspace directory. Safety is the fencing token inside that file. Liveness is a wall-clock lease TTL. The worker calls a real OpenAI-compatible Chat Completions API with a token, base URL, and model name from the environment.
 
-Build the six steps in order. Do not start step N+1 until step N's unit-test command and framework procedure both pass. MCP tool calls are step 6. Steps 1 through 5 do not discover or call MCP servers.
+Build the seven steps in order. Do not start step N+1 until step N's unit-test command and framework procedure both pass. MCP tool calls are step 6. Steps 1 through 5 do not discover or call MCP servers. Context packing and the trajectory log are step 7. Steps 1 through 6 do not pack a context budget and do not write trajectory rows.
 
 ## Rules for every step
 
@@ -331,7 +331,7 @@ python -m agent_engine self-test --step 4 --live --data-root /tmp/agent-step4-li
 - `src/agent_engine/adapters/workspace/cow.py` implements the same `Workspace` port. Layout: `tenants/{tenant_id}/tasks/{task_id}/{base,work,snapshots/{step}}`. `composition.py` now wires `CowWorkspace` where step 4 wired `plain`.
 - Seed hardlinks `base/` into `work/`. The adapter never opens `base/` for write and never `chmod`s or writes an inode with `st_nlink > 1`. Copy-break replaces the work directory entry with a new inode, then writes.
 - `snapshot(step)` hardlinks work files and writes `tombstones.json`. `os.link` raising `EXDEV` fails the test. Snapshot creation may fsync. Rollback does not.
-- `rollback(step)` relinks work from that snapshot, restores tombstones, and marks later `step_intents` and cache rows `rolled_back` in that tenant database under the fence. The sub-5ms measurement wraps only the relink.
+- `rollback(step)` relinks work from that snapshot, restores tombstones, and marks later `step_intents` and cache rows `rolled_back` in that tenant database under the fence. When step 7's trajectory rows exist, the same fenced rollback marks later trajectory rows `rolled_back` too. The sub-5ms measurement wraps only the relink.
 - `remove_file` is on the workspace port for the CoW test. Model tools remain `read_file`, `replace_text`, `run_checks`, and `finish`.
 - `src/agent_engine/worker.py` is started with `subprocess`, then opens its own tenant database. It acquires a lease, heartbeats on a second connection every `ttl/3`, and runs `ReactLoop`. If the heartbeat matches zero rows, it closes the HTTP socket and does not start T2. `AGENT_CRASH_AFTER` skips renew and raises `SIGKILL` at the named point. `AGENT_MUTATE_AFTER=read_file` appends one byte before the next tool.
 - Model-backed leases are 180s. Demo 2 drops to a 2s TTL after the edit is on disk and stops the heartbeat. Demo 4 uses a 1s TTL.
@@ -452,6 +452,62 @@ python -m pytest tests/test_mcp_tools.py tests/test_cli_step6.py -q --cov=agent_
 python -m agent_engine self-test --through 6 --data-root /tmp/agent-step6
 ```
 
+## Step 7 — Context builder, window budget, trajectory (75 min)
+
+Steps 1 through 6 send the raw transcript and do not store a trajectory. This step puts a context builder in front of each model call. The adder demo and its 8-step cap stay as they are.
+
+### Architectural choices
+
+- `ContextBuilder.pack(tenant_id, task_id) -> messages` lives in `src/agent_engine/application/context.py`. It does not import sqlite or adapters. `composition.py` calls it immediately before `Llm.complete`. The verifier still does not read the transcript.
+- Two built-in search tools, one ReAct step each. T1 commits before the read. T2 commits after. `list_files` lists relative paths under the work root. `search_text` finds a literal substring and returns at most 20 hits, each with path, line, and a short snippet. `..` and absolute paths raise and write nothing. Search is not a shell. The model does not pass argv. Both tools use the `Workspace` port and do not leave the work root.
+- `remember` writes one knowledge note: path, quote, and the model's own note. Notes live in that tenant file, table `knowledge` (`tenant_id`, `task_id`, `note_id`, `path`, `quote`, `body`, `source_step`). The model builds this set by calling `remember`. The engine does not embed files and does not add a vector index. A note that contains the bearer token is stored with the token redacted.
+- The prompt budget is the operator setting `context_token_budget`, default 8000. Size is `len(text) // 4`. There is no tokenizer dependency. Pack order is fixed: system rules and the task prompt, then knowledge notes newest first, then the newest trajectory steps in full. Those rules and the task prompt are never dropped.
+- When the pack exceeds the budget, older tool results shrink to the outcome line: tool name, `StaleContent` or exit code, and the sha256. File bodies are not repeated. If the pack is still over, one tool-free summary call compresses the dropped middle into a `context_summary` trajectory row. The original rows stay stored. The prompt keeps the newest summary plus the newest steps. A summary cannot write `completed` or `rejected` and does not count as a coding step. The summary request uses the same bearer redaction as the chat client. `AGENT_LLM_API_KEY` is not part of the text being summarized.
+- New table `trajectory` in each tenant file: `tenant_id`, `task_id`, `seq`, `step_index`, `kind`, `body_json`. Kinds are `model_inference`, `tool_call`, `tool_result`, `knowledge`, and `context_summary`. A stamp trigger aborts an insert whose `tenant_id` disagrees with `tenant.id`. Open applies `CREATE TABLE IF NOT EXISTS` for `knowledge` and `trajectory`, so an existing tenant file gains the tables.
+- T2 appends the trajectory in the same fenced transaction as the step result and the `messages` row. `model_inference` stores the assistant text and the chosen tool. `tool_call` stores the name and arguments. `tool_result` stores the outcome that followed, including `StaleContent` and the current hash, or the check status. `knowledge` stores the note from `remember`. Resume and a successor worker read this log. The prompt is a packed view of it, not a second source of truth.
+
+### Isolation
+
+Knowledge notes and trajectory rows in `globex/engine.db` are not visible to `acme`. Search cannot resolve outside the work root. The summary call cannot set `tasks.status`. The bearer token is absent from trajectory bodies and from knowledge notes.
+
+### Documented code
+
+- `src/agent_engine/application/context.py`: docstring states pack order, the token estimate, truncation, the summary call, and that the builder does not set `completed` or `rejected`.
+- `src/agent_engine/adapters/sqlite/trajectory_store.py`: docstring states the fenced T2 append and the stamp on `knowledge` and `trajectory`.
+- `README.md` gains `list_files`, `search_text`, `remember`, `context_token_budget`, and `self-test --step 7`.
+
+### Files
+
+`src/agent_engine/application/context.py`, `src/agent_engine/adapters/sqlite/trajectory_store.py`, `tests/test_context_budget.py`, `tests/test_cli_step7.py`. Extend `schema.sql`, `composition.py`, and `react.py` so search and `remember` are ordinary steps. Update `README.md`.
+
+### Unit tests
+
+Coverage floor: 85% on `agent_engine.application.context`. Offline. The canned transport supplies search and `remember`. No network.
+
+- `test_search_text_stays_inside_the_work_root`
+- `test_remember_is_visible_on_the_next_model_call`
+- `test_acme_knowledge_is_invisible_in_globex`
+- `test_over_budget_truncates_old_tool_bodies_and_keeps_the_outcome`
+- `test_summary_replaces_the_middle_and_stores_a_context_summary`
+- `test_summary_does_not_set_status`
+- `test_t2_appends_inference_tool_call_and_result`
+- `test_bearer_token_is_absent_from_trajectory_and_notes`
+- `test_self_test_step7_canned_search_prints_pass`
+
+### Framework test
+
+1. Provision `acme` and `globex`. Copy a two-file work tree under `acme`'s task. `run-task --tenant acme --task fix-adder --llm canned` with a canned `search_text`, then `remember`, then `read_file`. The next canned request's messages include the remembered note. `globex/engine.db` has no `knowledge` row and no `trajectory` row.
+2. Replay the same task with `context_token_budget` smaller than the stored tool bodies. The log shows one `context_summary`. The older tool result in the prompt is the outcome line, and the full result remains in `trajectory`. `tasks.status` is not `completed`.
+3. Query `trajectory` for that task. The rows include `model_inference`, `tool_call`, and `tool_result` for the search step. The bearer token is not in those bodies.
+4. Re-run the step 7 unit-test command.
+
+### Exit gate
+
+```bash
+python -m pytest tests/test_context_budget.py tests/test_cli_step7.py -q --cov=agent_engine.application.context --cov-fail-under=85
+python -m agent_engine self-test --through 7 --data-root /tmp/agent-step7
+```
+
 ## Demo map
 
 - Demo 1 happy-path repair: live model in step 4, scenario in step 5.
@@ -460,6 +516,7 @@ python -m agent_engine self-test --through 6 --data-root /tmp/agent-step6
 - Demo 4 `SIGSTOP` and lease steal: clock-injected steal in step 2, real signals in step 5.
 - Demo 5 stale hash and forced `finish` rejected by the verifier: edits in step 3, gate in step 4, live scenario in step 5. The background byte stays. The model is told `StaleContent` and the new hash. A later `finish` that does not pass the checks is `rejected`.
 - Demo 6 sub-5ms copy-on-write rollback: step 5.
+- Context search, a forced summary, and trajectory replay: step 7. They are not part of demos 1 through 6.
 - Tenant file isolation: step 1. Cross-file lease denial: step 2. Path jail: step 3. Cache file partition: step 4. `globex` sentinel: step 5.
 
 ## Done

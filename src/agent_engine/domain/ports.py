@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
-from agent_engine.domain.models import Task, Tenant, TenantId
+from agent_engine.domain.models import EditResult, StepView, Task, Tenant, TenantId, TextEdit, ToolCall
 
 
 class TenantDirectory(Protocol):
@@ -267,5 +267,287 @@ class Workspace(Protocol):
 
         Returns:
             None.
+        """
+        ...  # pragma: no cover
+
+
+class Editor(Protocol):
+    """Optimistic edits. The loop calls this port and does not hash files itself."""
+
+    def apply(self, workspace: Workspace, edit: TextEdit) -> EditResult:
+        """Replace edit.old once when the preimage hash still matches.
+
+        Args:
+            workspace: Work root that owns the file.
+            edit: Relative path, expected preimage hash, and the two snippets.
+
+        Returns:
+            applied or already_applied.
+
+        Raises:
+            ValueError: The path escapes the work root, or old is empty.
+            StaleContent: The hash does not match, or old matches zero times.
+            AmbiguousEdit: old matches more than once.
+        """
+        ...  # pragma: no cover
+
+    def resume(self, workspace: Workspace) -> None:
+        """Delete leftover temp files in the work root.
+
+        Args:
+            workspace: Work root that may contain ``*.tmp`` files from a crash.
+
+        Returns:
+            None.
+        """
+        ...  # pragma: no cover
+
+
+class CheckRunner(Protocol):
+    """Operator-owned checks. The model does not choose the argv."""
+
+    def run(self, work_root: Path) -> tuple[bool, str, str]:
+        """Run checks/commands inside the jail.
+
+        Args:
+            work_root: Task work tree. PYTHONPATH for the child points here.
+
+        Returns:
+            ok, stdout, and stderr. This method does not change tasks.status.
+
+        Raises:
+            None. A timeout or a non-zero exit is ok False.
+        """
+        ...  # pragma: no cover
+
+
+class Llm(Protocol):
+    """One Chat Completions turn. Offline tests supply a canned implementation."""
+
+    def post_count(self) -> int:
+        """Return how many completions this object has requested.
+
+        Returns:
+            The number of complete calls.
+        """
+        ...  # pragma: no cover
+
+    def complete(self, messages: list[dict[str, object]]) -> tuple[ToolCall, ...]:
+        """Ask the model for the next tool calls.
+
+        Args:
+            messages: Transcript in Chat Completions shape.
+
+        Returns:
+            The tool calls from this message, in order. Empty when the model
+            names no tool.
+
+        Raises:
+            ValueError: The response is not a chat completion.
+        """
+        ...  # pragma: no cover
+
+
+class StepLog(Protocol):
+    """Intent, cache, and transcript rows inside one tenant database."""
+
+    def task_status(self, tenant_id: TenantId, task_id: str) -> str:
+        """Return tasks.status for this task.
+
+        Args:
+            tenant_id: Tenant bound to this store.
+            task_id: Task primary key.
+
+        Returns:
+            The status text.
+
+        Raises:
+            TaskNotFound: The task row does not exist.
+        """
+        ...  # pragma: no cover
+
+    def open_intent(self, tenant_id: TenantId, task_id: str) -> StepView | None:
+        """Return the newest intent_logged agent step.
+
+        Args:
+            tenant_id: Tenant bound to this store.
+            task_id: Task primary key.
+
+        Returns:
+            The open step, or None. commit_marker rows are ignored.
+        """
+        ...  # pragma: no cover
+
+    def next_index(self, tenant_id: TenantId, task_id: str) -> int:
+        """Return the next step_index, including marker rows.
+
+        Args:
+            tenant_id: Tenant bound to this store.
+            task_id: Task primary key.
+
+        Returns:
+            One past the highest step_index, or 0 when the task has no steps.
+        """
+        ...  # pragma: no cover
+
+    def agent_count(self, tenant_id: TenantId, task_id: str) -> int:
+        """Count agent steps, excluding commit_marker.
+
+        Args:
+            tenant_id: Tenant bound to this store.
+            task_id: Task primary key.
+
+        Returns:
+            The number of agent step rows.
+        """
+        ...  # pragma: no cover
+
+    def list_messages(self, tenant_id: TenantId, task_id: str) -> list[tuple[int, str, str]]:
+        """Return the transcript in seq order.
+
+        Args:
+            tenant_id: Tenant bound to this store.
+            task_id: Task primary key.
+
+        Returns:
+            Tuples of seq, role, and body_json.
+        """
+        ...  # pragma: no cover
+
+    def mark_running(
+        self,
+        tenant_id: TenantId,
+        task_id: str,
+        worker_id: str,
+        token: int,
+        now: float,
+    ) -> None:
+        """Set tasks.status to running while the fence matches.
+
+        Args:
+            tenant_id: Tenant bound to this store.
+            task_id: Task primary key.
+            worker_id: Current lease owner.
+            token: Fencing token the caller holds.
+            now: Instant compared with lease_expires_at.
+
+        Returns:
+            None. Already running is a no-op when the fence matches.
+
+        Raises:
+            TaskNotFound: The task row does not exist.
+            FenceRejected: The token, owner, or expiry does not match.
+        """
+        ...  # pragma: no cover
+
+    def insert_intent(
+        self,
+        tenant_id: TenantId,
+        task_id: str,
+        step_index: int,
+        idempotency_key: str,
+        tool_name: str,
+        args_json: str,
+        worker_id: str,
+        token: int,
+        now: float,
+        messages: tuple[tuple[str, str], ...],
+    ) -> None:
+        """Commit one intent_logged row before any tool side effect.
+
+        Args:
+            tenant_id: Tenant bound to this store.
+            task_id: Task primary key.
+            step_index: Primary key inside the task.
+            idempotency_key: SHA256 of the canonical step identity.
+            tool_name: Tool the step will run.
+            args_json: Model arguments.
+            worker_id: Current lease owner.
+            token: Fencing token the caller holds.
+            now: Instant compared with lease_expires_at.
+            messages: Role and body_json rows appended in this transaction.
+
+        Returns:
+            None. The transaction is committed before this method returns.
+
+        Raises:
+            TaskNotFound: The task row does not exist.
+            FenceRejected: The fence does not match.
+        """
+        ...  # pragma: no cover
+
+    def commit_step(
+        self,
+        tenant_id: TenantId,
+        task_id: str,
+        step_index: int,
+        idempotency_key: str,
+        result_json: str,
+        worker_id: str,
+        token: int,
+        now: float,
+        messages: tuple[tuple[str, str], ...],
+    ) -> None:
+        """Commit the step result, the cache row, and the transcript under the fence.
+
+        Args:
+            tenant_id: Tenant bound to this store.
+            task_id: Task primary key.
+            step_index: Intent row to move from intent_logged to committed.
+            idempotency_key: Cache key stored on the intent.
+            result_json: Tool result.
+            worker_id: Current lease owner.
+            token: Fencing token the caller holds.
+            now: Instant compared with lease_expires_at.
+            messages: Role and body_json rows appended in this transaction.
+
+        Returns:
+            None.
+
+        Raises:
+            TaskNotFound: The task row does not exist.
+            FenceRejected: The token, owner, or expiry does not match.
+            ValueError: The fence matches and the intent row is absent.
+        """
+        ...  # pragma: no cover
+
+    def cache_get(self, tenant_id: TenantId, idempotency_key: str) -> str | None:
+        """Return a cached result from this tenant file.
+
+        Args:
+            tenant_id: Tenant bound to this store.
+            idempotency_key: SHA256 key.
+
+        Returns:
+            result_json, or None when this file has no such key.
+        """
+        ...  # pragma: no cover
+
+    def set_terminal(
+        self,
+        tenant_id: TenantId,
+        task_id: str,
+        status: str,
+        worker_id: str,
+        token: int,
+        now: float,
+    ) -> None:
+        """Write completed or rejected while the fence matches.
+
+        Args:
+            tenant_id: Tenant bound to this store.
+            task_id: Task primary key.
+            status: completed or rejected.
+            worker_id: Current lease owner.
+            token: Fencing token the caller holds.
+            now: Instant compared with lease_expires_at.
+
+        Returns:
+            None. The same terminal status already stored is a no-op.
+
+        Raises:
+            TaskNotFound: The task row does not exist.
+            FenceRejected: The token, owner, or expiry does not match.
+            ValueError: status is not completed or rejected.
         """
         ...  # pragma: no cover

@@ -1,17 +1,21 @@
 """Scripted self-test procedures for the CLI gate.
 
-This module owns the fixed tenants, task id, worker ids, timestamps, and the
-jail and edit checks for steps 1 through 3. It is not the product command
-path. A failed check raises. run_self_test turns that into PASS or FAIL.
+This module owns the fixed tenants, task id, worker ids, timestamps, the
+jail and edit checks, and the canned ReAct procedure for steps 1 through 4.
+It is not the product command path. A failed check raises. run_self_test
+turns that into PASS or FAIL. --live on step 4 calls the real model.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
+
+from agent_engine.composition import format_report, run_task
 
 from agent_engine.adapters.exec.jail import Jail, tool_env
 from agent_engine.adapters.sqlite.db import open_tenant_db
@@ -36,13 +40,16 @@ _WORKER_B = "22222222-2222-4222-8222-222222222222"
 _TASK_ID = "fix-adder"
 
 
-def run_self_test(data_root: Path, step: int | None, through: int | None) -> int:
+def run_self_test(
+    data_root: Path, step: int | None, through: int | None, *, live: bool = False
+) -> int:
     """Run one self-test step, or every step through a number.
 
     Args:
         data_root: Directory that contains tenants/. The procedure writes there.
         step: A single step number. Ignored as an upper bound when through is set.
-        through: Run steps 1 through this number.
+        through: Run steps 1 through this number. Those procedures stay offline.
+        live: When step 4 is selected by itself, call the real model.
 
     Returns:
         0 when the procedure prints PASS. 1 when it prints FAIL.
@@ -52,12 +59,12 @@ def run_self_test(data_root: Path, step: int | None, through: int | None) -> int
         print("self-test requires --step or --through", file=sys.stderr)
         return 1
     if through is not None:
-        if through < 1 or through > 3 or (step is not None and (step < 1 or step > through)):
+        if through < 1 or through > 4 or (step is not None and (step < 1 or step > through)):
             print("FAIL")
             print(f"step {through} is not implemented", file=sys.stderr)
             return 1
         steps = range(1, through + 1)
-    elif step not in (1, 2, 3):
+    elif step not in (1, 2, 3, 4):
         print("FAIL")
         print(f"step {step} is not implemented", file=sys.stderr)
         return 1
@@ -69,8 +76,10 @@ def run_self_test(data_root: Path, step: int | None, through: int | None) -> int
                 _run_step1(data_root)
             elif number == 2:
                 _run_step2(data_root)
-            else:
+            elif number == 3:
                 _run_step3(data_root)
+            else:
+                _run_step4(data_root, live=live and through is None)
     except (
         UnknownTenant,
         TenantMismatch,
@@ -211,6 +220,84 @@ def _run_step3(data_root: Path) -> None:
         raise OSError("expected StaleContent after the file changed")
     if not adder.read_bytes().endswith(b"x"):
         raise OSError("stale replace changed the file")
+
+
+def _run_step4(data_root: Path, *, live: bool) -> None:
+    """Repair the adder with a canned model, then reject a forced finish.
+
+    A live run calls the real model on a fresh broken copy and expects completed.
+    """
+    if live:
+        work = _prepare_adder(data_root, "acme", "fix-adder-live")
+        _prepare_tenant(data_root, "globex")
+        report = run_task(data_root, TenantId("acme"), "fix-adder-live", llm="live")
+        print(format_report(report))
+        if report.status != "completed":
+            raise OSError(f"live run status is {report.status}")
+        if b"return a + b" not in (work / "adder.py").read_bytes():
+            raise OSError("live run left the broken adder in place")
+        return
+    work = _prepare_adder(data_root, "acme", _TASK_ID)
+    _prepare_tenant(data_root, "globex")
+    init_task(data_root, TenantId("globex"), _TASK_ID)
+    first = run_task(data_root, TenantId("acme"), _TASK_ID, llm="canned")
+    print(format_report(first))
+    if first.status != "completed" or first.cache_hit:
+        raise OSError(f"canned repair status is {first.status}")
+    if b"return a + b" not in (work / "adder.py").read_bytes():
+        raise OSError("canned repair did not change the adder")
+    if _step_count(data_root, "globex") != 0:
+        raise OSError("acme run wrote globex step_intents")
+    second = run_task(data_root, TenantId("acme"), _TASK_ID, llm="canned")
+    print(format_report(second))
+    if not second.cache_hit or second.executions != 0 or second.posts != 0:
+        raise OSError("replay was not a cache hit")
+    if second.status != "completed":
+        raise OSError("cache hit did not keep completed")
+    rejected_work = _prepare_adder(data_root, "acme", "reject-adder")
+    rejected = run_task(
+        data_root,
+        TenantId("acme"),
+        "reject-adder",
+        llm="canned",
+        tool_choice="finish",
+    )
+    print(format_report(rejected))
+    if rejected.status != "rejected":
+        raise OSError(f"forced finish status is {rejected.status}")
+    if get_task(data_root, TenantId("acme"), "reject-adder").status != "rejected":
+        raise OSError("tasks.status was not rejected")
+    if b"return a - b" not in (rejected_work / "adder.py").read_bytes():
+        raise OSError("forced finish changed the broken adder")
+
+
+def _prepare_tenant(data_root: Path, tenant: str) -> None:
+    provision(data_root, TenantId(tenant), tenant.capitalize())
+
+
+def _prepare_adder(data_root: Path, tenant: str, task_id: str) -> Path:
+    _prepare_tenant(data_root, tenant)
+    init_task(data_root, TenantId(tenant), task_id)
+    work = data_root / "tenants" / tenant / "tasks" / task_id
+    work.mkdir(parents=True, exist_ok=True)
+    fixture = Path(__file__).resolve().parents[2] / "fixtures" / "broken_adder"
+    shutil.copyfile(fixture / "adder.py", work / "adder.py")
+    checks = data_root / "checks"
+    checks.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(fixture / "test_adder.py", checks / "test_adder.py")
+    copied = work / "test_adder.py"
+    if copied.exists():
+        copied.unlink()
+    return work
+
+
+def _step_count(data_root: Path, tenant: str) -> int:
+    connection = open_tenant_db(data_root, TenantId(tenant), read_only=True)
+    try:
+        row = connection.execute("SELECT COUNT(*) AS n FROM step_intents").fetchone()
+    finally:
+        connection.close()
+    return int(row["n"])
 
 
 def _wait_dead(pid: int) -> None:
