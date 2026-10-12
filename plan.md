@@ -2,7 +2,7 @@
 
 The prototype is a single-machine, multi-process engine. Each tenant has its own SQLite file and workspace directory. Safety is the fencing token inside that file. Liveness is a wall-clock lease TTL. The worker calls a real OpenAI-compatible Chat Completions API with a token, base URL, and model name from the environment.
 
-Build the five steps in order. Do not start step N+1 until step N's unit-test command and framework procedure both pass.
+Build the six steps in order. Do not start step N+1 until step N's unit-test command and framework procedure both pass. MCP tool calls are step 6. Steps 1 through 5 do not discover or call MCP servers.
 
 ## Rules for every step
 
@@ -249,11 +249,13 @@ python -m agent_engine self-test --through 3 --data-root /tmp/agent-step3
 ### Architectural choices
 
 - `src/agent_engine/adapters/workspace/plain.py` implements `Workspace` as a flat directory. The editor and the loop call this port only.
-- `OpenAIChatLlm` POSTs `{base_url}/chat/completions` with `Authorization: Bearer`, `tools` (`read_file`, `replace_text`, `finish`), and stdlib `urllib`. Socket timeout is 60s. A test `Transport` records posts and returns canned bodies. The product worker, the demo, and `test_react_happy_live` construct `OpenAIChatLlm` only.
+- `OpenAIChatLlm` POSTs `{base_url}/chat/completions` with `Authorization: Bearer`, `tools` (`read_file`, `replace_text`, `run_checks`, `finish`), and stdlib `urllib`. Socket timeout is 60s. A test `Transport` records posts and returns canned bodies. The product worker, the demo, and `test_react_happy_live` construct `OpenAIChatLlm` only. MCP tools are not offered until step 6.
+- `run_checks` is a built-in tool, not an MCP tool. The model calls it with no arguments to compile and run tests before `finish`. The command list is `checks/commands`, outside the writable work tree, so a C++ task and a Python task do not share a compiler. Each line is one argv in order. The Python fixture runs `python -m compileall` on the work tree, then `python -m unittest` on the check file with `PYTHONPATH` pointed at the work tree. A C++ task lists its own argv, for example `cmake --build build` and then `ctest --test-dir build --output-on-failure`. `Jail.run` executes those argv and nothing the model sends. The child env is `PATH` and `PYTHONPATH` only, so the compiler must already be on `PATH`. A missing compiler is a failed tool result. The model does not install it. Stdout and stderr come back as the tool result. The task stays `running`. `run_checks` does not write `completed` or `rejected`.
+- `StaleContent` keeps the bytes already on disk, including a background edit, and does not apply the model's patch. The engine does not revert the file and does not invent a merged patch. T2 records `StaleContent` and the current SHA256 as that step's tool result. The task stays `running`. The next step may call the model again so it can `read_file` and send a new `replace_text`. The loop still stops at 8 steps.
 - `ReactLoop.run` reads the latest step first. `committed` returns the cache and does not insert or call the model. `intent_logged` resumes that row and does not call the model. No row calls the model, then T1 inserts exactly one tool call and commits before any file write. Extra tool calls in one message become later steps.
 - Idempotency key is SHA256 of canonical JSON `{tenant_id, task_id, step_index, tool, args}` with `sort_keys=True`.
 - T2 writes the step result, the cache row, and the `messages` transcript in one fenced transaction.
-- `finish` does not change `tasks.status`. `VerifyGate` runs `python -m unittest` on `fixtures/broken_adder/test_adder.py` from `checks/` outside the tool root, with `PYTHONPATH` pointed at the work tree, inside the jail, with env `PATH` and `PYTHONPATH` only. Pass writes `completed`. Fail writes `rejected`. Both are terminal and use the fence predicate. `FenceRejected` leaves the task `running`.
+- `finish` does not change `tasks.status`. `VerifyGate` runs the same `checks/commands` list, in the same jail, as `run_checks`. Pass writes `completed`. Fail writes `rejected`. Both are terminal and use the fence predicate. `FenceRejected` leaves the task `running`. The model is expected to call `run_checks` on an earlier step, read the failure, and patch again. A failed `finish` does not return the compiler or test output for another try.
 - A work tree whose `test_adder.py` differs from `checks/` fails the gate. The loop stops at 8 steps.
 - The bearer token in the log is redacted. The request uses the env var named by the tenant row.
 - `src/agent_engine/composition.py` wires stores, plain workspace, jail, verifier, and the LLM. Missing `AGENT_LLM_API_KEY` fails at startup when the command needs a live model.
@@ -261,14 +263,14 @@ python -m agent_engine self-test --through 3 --data-root /tmp/agent-step3
 
 ### Isolation
 
-Cache rows in `globex/engine.db` are not visible to `acme`. The verifier does not receive the transcript and cannot be pointed at an argv chosen by the model. The model cannot write the check file. Secrets do not enter the jail. T1 is durable before the tool runs, so a crash keeps the intent.
+Cache rows in `globex/engine.db` are not visible to `acme`. The verifier does not receive the transcript and cannot be pointed at an argv chosen by the model. The model cannot write `checks/commands` or the check file. Secrets do not enter the jail. T1 is durable before the tool runs, so a crash keeps the intent.
 
 ### Documented code
 
 - `src/agent_engine/application/react.py`: docstring lists the read-step, T1, execute, T2 order and the one-tool-call rule.
 - `src/agent_engine/application/verify_gate.py`: docstring states it is the only writer of `completed` and `rejected`, and that it does not read the transcript.
 - `src/agent_engine/adapters/llm/openai_chat.py`: docstring documents the URL, the bearer header, tool-call parsing, and redaction.
-- `src/agent_engine/adapters/verifier/external.py`: docstring documents the fixed command, `checks/`, and the scrubbed environment.
+- `src/agent_engine/adapters/verifier/external.py`: docstring documents `checks/commands`, the jail, and the scrubbed environment. The Python fixture is the default list, not the only language.
 - `fixtures/broken_adder/adder.py`: module docstring states `add` is intentionally `a - b`.
 - `README.md` gains `.env` setup, a shared `AGENT_LLM_API_KEY`, a per-tenant `llm_api_key_env`, `run-task --llm canned`, `run-task` against a live base URL, and `self-test --step 4` versus `self-test --step 4 --live`.
 
@@ -288,8 +290,10 @@ Coverage floor: 85% on `agent_engine.application.react`, `agent_engine.applicati
 - `test_committed_step_is_cache_hit_with_zero_executions_and_zero_posts`
 - `test_same_key_on_globex_file_is_a_miss`
 - `test_replay_of_applied_edit_is_already_applied_and_writes_nothing`
+- `test_stale_replace_keeps_background_bytes_and_feeds_the_error_to_the_next_step`
 - `test_one_message_with_two_tool_calls_creates_two_steps`
 - `test_finish_does_not_set_completed`
+- `test_run_checks_is_jailed_and_does_not_set_status`
 - `test_verifier_pass_sets_completed`
 - `test_verifier_fail_sets_rejected`
 - `test_modified_check_file_fails_the_gate`
@@ -328,7 +332,7 @@ python -m agent_engine self-test --step 4 --live --data-root /tmp/agent-step4-li
 - Seed hardlinks `base/` into `work/`. The adapter never opens `base/` for write and never `chmod`s or writes an inode with `st_nlink > 1`. Copy-break replaces the work directory entry with a new inode, then writes.
 - `snapshot(step)` hardlinks work files and writes `tombstones.json`. `os.link` raising `EXDEV` fails the test. Snapshot creation may fsync. Rollback does not.
 - `rollback(step)` relinks work from that snapshot, restores tombstones, and marks later `step_intents` and cache rows `rolled_back` in that tenant database under the fence. The sub-5ms measurement wraps only the relink.
-- `remove_file` is on the workspace port for the CoW test. Model tools remain `read_file`, `replace_text`, and `finish`.
+- `remove_file` is on the workspace port for the CoW test. Model tools remain `read_file`, `replace_text`, `run_checks`, and `finish`.
 - `src/agent_engine/worker.py` is started with `subprocess`, then opens its own tenant database. It acquires a lease, heartbeats on a second connection every `ttl/3`, and runs `ReactLoop`. If the heartbeat matches zero rows, it closes the HTTP socket and does not start T2. `AGENT_CRASH_AFTER` skips renew and raises `SIGKILL` at the named point. `AGENT_MUTATE_AFTER=read_file` appends one byte before the next tool.
 - Model-backed leases are 180s. Demo 2 drops to a 2s TTL after the edit is on disk and stops the heartbeat. Demo 4 uses a 1s TTL.
 - `src/agent_engine/demo.py` seeds `acme` and `globex`. Scenarios run as `acme`. `globex` gets a sentinel file and an empty task table. CLI: `demo --tenant acme --scenario N` and `--all`. `self-test --step 5` runs the offline copy-on-write and signal scenarios (4 and 6). `self-test --step 5 --live` runs scenarios 1, 2, 3, and 5, then `--all` is the documented full run.
@@ -392,13 +396,69 @@ python -m agent_engine self-test --step 5 --live --data-root /tmp/agent-step5-li
 python -m agent_engine demo --tenant acme --all
 ```
 
+## Step 6 — MCP tool calls (60 min)
+
+Steps 1 through 5 do not include MCP. This step adds it. The built-in tools stay `read_file`, `replace_text`, `run_checks`, and `finish`.
+
+### Architectural choices
+
+- The worker is the only MCP client. The model sees discovered tools as ordinary Chat Completions tools named `mcp__{server}__{tool}`. It does not open a socket, and it does not choose the server command or its arguments.
+- Servers come from `mcp.json` next to the data root. The operator writes it. Each entry is a server name, an argv, and an optional list of extra environment variable names. The model cannot add, remove, or rewrite an entry.
+- `McpClient.list_tools(server)` and `McpClient.call(server, tool, arguments)` speak MCP over stdio (`initialize`, `tools/list`, `tools/call`). The server process is started with `Jail.run`, cwd is the task work root, and the timeout is 30s. The child env is `tool_env()` plus only the names listed on that entry. `AGENT_LLM_API_KEY` is copied only when the entry names it.
+- A call is one ReAct step. T1 commits the intent before the server process starts. T2 stores the result and the transcript under the fence. The idempotency key includes the server name, the tool name, and the arguments.
+- A tool error, a timeout, or a protocol error is that step's result. The task stays `running`. The model can use a later step. The loop still stops at 8 steps. An MCP result cannot write `completed` or `rejected`.
+- `StaleContent` from `replace_text` is unchanged: the background bytes stay, and the model may patch again on a later step.
+- An MCP server may compile or run tests, and that run is jailed, but it is not the gate. `run_checks` and `VerifyGate` both run the operator's `checks/commands` list. A C++ compiler on that list is still not chosen by the model.
+- The model does not design the environment setup. It may call an MCP tool the operator already listed, including one that syncs dependencies inside the work tree, and it may choose the order of those calls from the tool results. It cannot add a server, change an argv, or emit a new install command such as a package-manager install of `g++`, `python`, or `go`. If `run_checks` reports that the toolchain is missing, that text is the tool result and the task stays `running`. The operator fixes `mcp.json` and `checks/commands` outside the loop.
+
+### Isolation
+
+A server argv from the model is ignored. `globex/engine.db` gains no transcript row from an `acme` MCP call. The jailed server does not receive `AGENT_LLM_API_KEY` unless that server's entry lists the name. An MCP call cannot set `tasks.status`.
+
+### Documented code
+
+- `src/agent_engine/adapters/mcp/client.py`: docstring states stdio MCP, the jail, the operator-owned `mcp.json`, and that the model cannot supply the server argv.
+- `README.md` gains `mcp.json`, the `mcp__{server}__{tool}` name, and `self-test --step 6`.
+
+### Files
+
+`src/agent_engine/adapters/mcp/client.py`, `fixtures/mcp/echo_server.py`, `tests/test_mcp_tools.py`, `tests/test_cli_step6.py`. Extend `composition.py` and `react.py` so a discovered tool is one more step, not a second loop. Update `README.md`.
+
+### Unit tests
+
+Coverage floor: 85% on `agent_engine.adapters.mcp.client`. No network. The echo server is a local stdio fixture.
+
+- `test_list_tools_namespaces_names_as_mcp_server_tool`
+- `test_call_uses_jail_and_returns_the_tool_result`
+- `test_child_env_omits_api_key_unless_the_entry_names_it`
+- `test_model_supplied_server_argv_is_ignored`
+- `test_model_cannot_add_a_toolchain_install`
+- `test_mcp_call_is_one_fenced_step_and_does_not_set_status`
+- `test_mcp_error_leaves_the_task_running`
+- `test_acme_mcp_call_does_not_write_globex`
+- `test_self_test_step6_echo_tool_prints_pass`
+
+### Framework test
+
+1. Write `mcp.json` with one server, `echo`, whose argv is `python fixtures/mcp/echo_server.py`. Do not list `AGENT_LLM_API_KEY`.
+2. Provision `acme` and `globex`. `run-task --tenant acme --task fix-adder --llm canned` with a canned `mcp__echo__ping`. The command prints the echo result. `tasks.status` is not `completed`. `globex/engine.db` has no new transcript row.
+3. Repeat with `AGENT_LLM_API_KEY` set in the parent. The echo result does not contain that value.
+4. Re-run the step 6 unit-test command.
+
+### Exit gate
+
+```bash
+python -m pytest tests/test_mcp_tools.py tests/test_cli_step6.py -q --cov=agent_engine.adapters.mcp.client --cov-fail-under=85
+python -m agent_engine self-test --through 6 --data-root /tmp/agent-step6
+```
+
 ## Demo map
 
 - Demo 1 happy-path repair: live model in step 4, scenario in step 5.
 - Demo 2 `SIGKILL` mid-step: fence in step 2, crash resume in step 5.
 - Demo 3 cache hit, zero side effects and zero extra HTTP posts: step 4, scenario in step 5.
 - Demo 4 `SIGSTOP` and lease steal: clock-injected steal in step 2, real signals in step 5.
-- Demo 5 stale hash and forced `finish` rejected by the verifier: edits in step 3, gate in step 4, live scenario in step 5.
+- Demo 5 stale hash and forced `finish` rejected by the verifier: edits in step 3, gate in step 4, live scenario in step 5. The background byte stays. The model is told `StaleContent` and the new hash. A later `finish` that does not pass the checks is `rejected`.
 - Demo 6 sub-5ms copy-on-write rollback: step 5.
 - Tenant file isolation: step 1. Cross-file lease denial: step 2. Path jail: step 3. Cache file partition: step 4. `globex` sentinel: step 5.
 

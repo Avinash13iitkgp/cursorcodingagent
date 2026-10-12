@@ -2,7 +2,7 @@
 
 Local, multi-process coding-agent engine. Each tenant has its own SQLite database and workspace directory. A fencing token makes a stale worker unable to commit. The worker calls an OpenAI-compatible Chat Completions API with a token you provide.
 
-The build is five steps, specified in [plan.md](plan.md). Do not start a step until the previous step's pytest gate and `self-test` gate both pass. This guide is the setup and test map. Steps 1 and 2 are implemented: `provision`, `init-task`, `pragma`, `acquire`, `renew`, `release`, `show-lease`, and `self-test --step 1`, `--step 2`, and `--through 2`. Steps 3 through 5 stay specified in `plan.md`.
+The build is six steps, specified in [plan.md](plan.md). Do not start a step until the previous step's pytest gate and `self-test` gate both pass. This guide is the setup and test map. Steps 1 through 3 are implemented: `provision`, `init-task`, `pragma`, `acquire`, `renew`, `release`, `show-lease`, `jail`, `replace`, and `self-test` through step 3. Steps 4 through 6 stay specified in `plan.md`. Step 6 is MCP tool calls.
 
 ## Requirements
 
@@ -99,12 +99,16 @@ Renew keeps the same fencing token and sets expiry to `--now` plus `--ttl`. A se
 
 ## 6. Jail and edits
 
+These commands are implemented. The jail's child environment is `PATH` and `PYTHONPATH` only. `self-test --step 3` runs the timeout and stale-hash procedure. `self-test --through 3` runs steps 1 through 3.
+
 ```bash
+python -m agent_engine self-test --step 3 --data-root /tmp/agent-step3
+python -m agent_engine self-test --through 3 --data-root /tmp/agent-step3
 python -m agent_engine jail --timeout 1 -- python fixtures/scripts/spawn_tree.py /tmp/agent-pids
 python -m agent_engine replace --root /tmp/agent-step3 --path adder.py --expected-sha256 "$HASH" --old "return a - b" --new "return a + b"
 ```
 
-The jail starts a new session and, on timeout, kills the process group. A replace whose hash does not match the file exits with `StaleContent` and writes nothing.
+The jail starts a new session and, on timeout, kills the process group. That command exits non-zero and prints `ToolTimeout`. Both pids in the file are then dead. A replace whose hash does not match the file exits with `StaleContent` and writes nothing.
 
 ## 7. Run a task
 

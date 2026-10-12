@@ -213,3 +213,59 @@ class LeaseStore(Protocol):
             FenceRejected: Zero rows because the fence does not match.
         """
         ...  # pragma: no cover
+
+
+class Workspace(Protocol):
+    """Files under one work root. The editor uses this port and not a raw base path."""
+
+    def resolve(self, relative_path: str) -> Path:
+        """Return the absolute path of a relative work-root entry.
+
+        Args:
+            relative_path: Path relative to the work root.
+
+        Returns:
+            The resolved path inside the work root.
+
+        Raises:
+            ValueError: The path is absolute or resolves outside the work root.
+        """
+        ...  # pragma: no cover
+
+    def read(self, relative_path: str) -> bytes:
+        """Read one file inside the work root.
+
+        Args:
+            relative_path: Path relative to the work root.
+
+        Returns:
+            The file bytes.
+
+        Raises:
+            ValueError: The path escapes the work root.
+            FileNotFoundError: The file does not exist.
+        """
+        ...  # pragma: no cover
+
+    def write(self, relative_path: str, data: bytes) -> None:
+        """Replace one file inside the work root.
+
+        Args:
+            relative_path: Path relative to the work root.
+            data: Bytes to store.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: The path escapes the work root.
+        """
+        ...  # pragma: no cover
+
+    def cleanup_tmp(self) -> None:
+        """Delete leftover ``*.tmp`` files under the work root.
+
+        Returns:
+            None.
+        """
+        ...  # pragma: no cover

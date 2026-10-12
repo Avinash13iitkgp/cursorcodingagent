@@ -1,28 +1,35 @@
 """Scripted self-test procedures for the CLI gate.
 
-This module owns the fixed tenants, task id, worker ids, and timestamps used
-to check steps 1 and 2. It is not the product command path: acquire, renew,
-and release stay in the process entrypoint and take their arguments from the
-user. A failed check raises. run_self_test turns that into PASS or FAIL.
+This module owns the fixed tenants, task id, worker ids, timestamps, and the
+jail and edit checks for steps 1 through 3. It is not the product command
+path. A failed check raises. run_self_test turns that into PASS or FAIL.
 """
 
 from __future__ import annotations
 
+import hashlib
+import os
 import sys
+import time
 from pathlib import Path
 
+from agent_engine.adapters.exec.jail import Jail, tool_env
 from agent_engine.adapters.sqlite.db import open_tenant_db
 from agent_engine.adapters.sqlite.lease_store import SqliteLeaseStore
 from agent_engine.adapters.sqlite.tenant_store import get_task, init_task, provision, read_pragmas
+from agent_engine.adapters.workspace.edits import FlatWorkspace, OptimisticEditor
 from agent_engine.application.leases import LeaseService, SystemClock
 from agent_engine.domain.errors import (
+    AmbiguousEdit,
     FenceRejected,
     LeaseNotHeld,
+    StaleContent,
     TaskNotFound,
     TenantMismatch,
+    ToolTimeout,
     UnknownTenant,
 )
-from agent_engine.domain.models import TenantId
+from agent_engine.domain.models import TenantId, TextEdit
 
 _WORKER_A = "11111111-1111-4111-8111-111111111111"
 _WORKER_B = "22222222-2222-4222-8222-222222222222"
@@ -45,12 +52,12 @@ def run_self_test(data_root: Path, step: int | None, through: int | None) -> int
         print("self-test requires --step or --through", file=sys.stderr)
         return 1
     if through is not None:
-        if through < 1 or through > 2 or (step is not None and (step < 1 or step > through)):
+        if through < 1 or through > 3 or (step is not None and (step < 1 or step > through)):
             print("FAIL")
             print(f"step {through} is not implemented", file=sys.stderr)
             return 1
         steps = range(1, through + 1)
-    elif step not in (1, 2):
+    elif step not in (1, 2, 3):
         print("FAIL")
         print(f"step {step} is not implemented", file=sys.stderr)
         return 1
@@ -60,14 +67,19 @@ def run_self_test(data_root: Path, step: int | None, through: int | None) -> int
         for number in steps:
             if number == 1:
                 _run_step1(data_root)
-            else:
+            elif number == 2:
                 _run_step2(data_root)
+            else:
+                _run_step3(data_root)
     except (
         UnknownTenant,
         TenantMismatch,
         TaskNotFound,
         FenceRejected,
         LeaseNotHeld,
+        StaleContent,
+        AmbiguousEdit,
+        ToolTimeout,
         ValueError,
         OSError,
     ) as exc:
@@ -143,6 +155,73 @@ def _run_step2(data_root: Path) -> None:
     globex = get_task(data_root, TenantId("globex"), _TASK_ID)
     if globex.fencing_token != 0 or globex.lease_owner is not None:
         raise OSError("globex lease changed during the acme procedure")
+
+
+def _run_step3(data_root: Path) -> None:
+    """Kill a process group on timeout, then reject a stale edit."""
+    data_root.mkdir(parents=True, exist_ok=True)
+    script = Path(__file__).resolve().parents[2] / "fixtures" / "scripts" / "spawn_tree.py"
+    pid_file = data_root / "jail-pids"
+    jail = Jail()
+    try:
+        jail.run(
+            [sys.executable, str(script), str(pid_file)],
+            cwd=data_root,
+            timeout_s=1,
+            env=tool_env(),
+        )
+    except ToolTimeout:
+        pass
+    else:
+        raise OSError("expected ToolTimeout from the sleeper tree")
+    pids = [int(line) for line in pid_file.read_text(encoding="utf-8").split()]
+    if len(pids) != 2:
+        raise OSError("spawn_tree did not write two pids")
+    for pid in pids:
+        _wait_dead(pid)
+    printed = jail.run(
+        [sys.executable, "-c", "print(123)"],
+        cwd=data_root,
+        timeout_s=5,
+        env=tool_env(),
+    )
+    if printed.returncode != 0 or "123" not in printed.stdout:
+        raise OSError(f"expected stdout 123, got {printed.stdout!r}")
+    original = b"return a - b\n"
+    adder = data_root / "adder.py"
+    adder.write_bytes(original)
+    digest = hashlib.sha256(original).hexdigest()
+    workspace = FlatWorkspace(data_root)
+    editor = OptimisticEditor()
+    applied = editor.apply(
+        workspace,
+        TextEdit("adder.py", digest, "return a - b", "return a + b"),
+    )
+    if applied.status != "applied" or adder.read_bytes() != b"return a + b\n":
+        raise OSError("replace did not swap the line")
+    adder.write_bytes(adder.read_bytes() + b"x")
+    try:
+        editor.apply(
+            workspace,
+            TextEdit("adder.py", digest, "return a - b", "return a + b"),
+        )
+    except StaleContent:
+        pass
+    else:
+        raise OSError("expected StaleContent after the file changed")
+    if not adder.read_bytes().endswith(b"x"):
+        raise OSError("stale replace changed the file")
+
+
+def _wait_dead(pid: int) -> None:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    raise OSError(f"pid {pid} still alive")
 
 
 def _lease_call(data_root: Path, tenant_id: TenantId, fn):

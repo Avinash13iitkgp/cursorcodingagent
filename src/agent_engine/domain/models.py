@@ -1,13 +1,14 @@
 """Frozen domain values. This module performs no I/O.
 
-Types: TenantId, Tenant, Task, and Lease. Constructing them does not touch the
-filesystem or SQLite. Invalid tenant ids raise ValueError.
+Types: TenantId, Tenant, Task, Lease, TextEdit, and EditResult. Constructing
+them does not touch the filesystem or SQLite. Invalid tenant ids raise ValueError.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Literal
 
 _TENANT_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _TASK_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -72,3 +73,20 @@ class Lease:
     worker_id: str
     fencing_token: int
     expires_at: float
+
+
+@dataclass(frozen=True)
+class TextEdit:
+    """One optimistic replacement. expected_sha256 is the caller's preimage hash."""
+
+    path: str
+    expected_sha256: str
+    old: str
+    new: str
+
+
+@dataclass(frozen=True)
+class EditResult:
+    """Outcome of an edit that changed nothing after the check, or wrote the new bytes."""
+
+    status: Literal["applied", "already_applied"]

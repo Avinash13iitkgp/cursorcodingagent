@@ -1,9 +1,10 @@
-"""Command line for tenant provisioning and fenced leases.
+"""Command line for tenant provisioning, leases, the jail, and edits.
 
 This module is the process edge. It parses arguments, opens one tenant
-database, and calls LeaseService for acquire, renew, and release. The
-scripted self-test procedure lives in agent_engine.self_test. Invalid ids,
-tenant boundary errors, and lease errors exit non-zero.
+database, and calls LeaseService for acquire, renew, and release. jail and
+replace do not take a tenant. The scripted self-test procedure lives in
+agent_engine.self_test. Invalid ids, tenant boundary errors, lease errors,
+and edit errors exit non-zero.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import os
 import sys
 from pathlib import Path
 
+from agent_engine.adapters.exec.jail import Jail, tool_env
 from agent_engine.adapters.sqlite.db import open_tenant_db
 from agent_engine.adapters.sqlite.lease_store import SqliteLeaseStore
 from agent_engine.adapters.sqlite.tenant_store import (
@@ -21,15 +23,19 @@ from agent_engine.adapters.sqlite.tenant_store import (
     provision,
     read_pragmas,
 )
+from agent_engine.adapters.workspace.edits import FlatWorkspace, OptimisticEditor
 from agent_engine.application.leases import LeaseService, SystemClock
 from agent_engine.domain.errors import (
+    AmbiguousEdit,
     FenceRejected,
     LeaseNotHeld,
+    StaleContent,
     TaskNotFound,
     TenantMismatch,
+    ToolTimeout,
     UnknownTenant,
 )
-from agent_engine.domain.models import Lease, TenantId
+from agent_engine.domain.models import Lease, TenantId, TextEdit
 from agent_engine.self_test import run_self_test
 
 
@@ -71,6 +77,17 @@ def main(argv: list[str] | None = None) -> int:
     show_lease.add_argument("--tenant", required=True)
     show_lease.add_argument("--task", required=True)
 
+    jail_cmd = sub.add_parser("jail")
+    jail_cmd.add_argument("--timeout", type=float, required=True)
+    jail_cmd.add_argument("argv", nargs=argparse.REMAINDER)
+
+    replace_cmd = sub.add_parser("replace")
+    replace_cmd.add_argument("--root", required=True)
+    replace_cmd.add_argument("--path", required=True)
+    replace_cmd.add_argument("--expected-sha256", required=True)
+    replace_cmd.add_argument("--old", required=True)
+    replace_cmd.add_argument("--new", required=True)
+
     try:
         parsed = parser.parse_args(rest)
     except SystemExit as exc:
@@ -81,6 +98,10 @@ def main(argv: list[str] | None = None) -> int:
             if live_status != 0:
                 return live_status
             return run_self_test(data_root, parsed.step, parsed.through)
+        if parsed.command == "jail":
+            return _run_jail(parsed)
+        if parsed.command == "replace":
+            return _run_replace(parsed)
         tenant_id = TenantId(parsed.tenant)
         if parsed.command == "provision":
             path = provision(data_root, tenant_id, parsed.display_name)
@@ -108,6 +129,9 @@ def main(argv: list[str] | None = None) -> int:
         TaskNotFound,
         FenceRejected,
         LeaseNotHeld,
+        StaleContent,
+        AmbiguousEdit,
+        ToolTimeout,
         ValueError,
     ) as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
@@ -151,6 +175,28 @@ def _add_lease_command(
         command.add_argument("--ttl", type=float, required=True)
     if token:
         command.add_argument("--token", type=int, required=True)
+
+
+def _run_jail(parsed: argparse.Namespace) -> int:
+    argv = list(parsed.argv)
+    if argv[:1] == ["--"]:
+        argv = argv[1:]
+    result = Jail().run(argv, cwd=Path.cwd(), timeout_s=parsed.timeout, env=tool_env())
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr or "")
+        return int(result.returncode)
+    sys.stdout.write(result.stdout or "")
+    return 0
+
+
+def _run_replace(parsed: argparse.Namespace) -> int:
+    workspace = FlatWorkspace(Path(parsed.root))
+    result = OptimisticEditor().apply(
+        workspace,
+        TextEdit(parsed.path, parsed.expected_sha256, parsed.old, parsed.new),
+    )
+    print(result.status)
+    return 0
 
 
 def _run_lease_command(data_root: Path, tenant_id: TenantId, parsed: argparse.Namespace) -> int:
