@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent_engine.adapters.exec.jail import Jail
+from agent_engine.adapters.mcp.client import McpClient
 from agent_engine.adapters.llm.openai_chat import (
     CannedTransport,
     OpenAIChatLlm,
@@ -352,7 +353,8 @@ class Worker:
             with self._lock:
                 self._service = service
                 self._lease = lease
-            model = self._model(cow.work_root)
+            mcp = McpClient(self.config.data_root, Jail(), cow.work_root)
+            model = self._model(cow.work_root, mcp.chat_tools())
             guarded_model = _GuardedLlm(model, self)
             self._llm = guarded_model
             beat = threading.Thread(target=self._heartbeat, name="lease-heartbeat")
@@ -379,6 +381,7 @@ class Worker:
                     checks,
                     store,
                 ),
+                mcp,
             )
             try:
                 result = loop.run(now, clock=SystemClock(), resume_only=self.config.resume_only)
@@ -497,17 +500,20 @@ class Worker:
         finally:
             connection.close()
 
-    def _model(self, work: Path) -> OpenAIChatLlm:
+    def _model(self, work: Path, extra_tools: list[dict[str, object]] | None = None) -> OpenAIChatLlm:
         if self.config.llm == "canned":
             return OpenAIChatLlm(
                 "http://canned.invalid",
                 "canned-token",
                 "canned",
                 CannedTransport(_canned_bodies(work, self.config.canned, self.config.tool_choice)),
+                extra_tools=extra_tools,
             )
         tenant = read_tenant(self.config.data_root, TenantId(self.config.tenant_id))
         api_key, base_url, model = _live_credentials(tenant.llm_api_key_env)
-        return OpenAIChatLlm(base_url, api_key, model, UrllibTransport())
+        return OpenAIChatLlm(
+            base_url, api_key, model, UrllibTransport(), extra_tools=extra_tools
+        )
 
 
 def serve(config: WorkerConfig) -> WorkerReport:

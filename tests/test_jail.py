@@ -59,6 +59,19 @@ def test_child_env_excludes_agent_llm_api_key(tmp_path: Path, monkeypatch: pytes
     assert result.stdout.strip() == "None"
 
 
+def test_stdin_is_delivered_to_the_child(tmp_path: Path) -> None:
+    """stdin is written to the child and then closed."""
+    result = Jail().run(
+        [sys.executable, "-c", "import sys; print(sys.stdin.read().strip())"],
+        cwd=tmp_path,
+        timeout_s=5,
+        env=tool_env(),
+        stdin="hello-stdin\n",
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == "hello-stdin"
+
+
 def _dead(pid: int) -> bool:
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:

@@ -1,10 +1,10 @@
 """OpenAI-compatible Chat Completions.
 
 complete POSTs {base_url}/chat/completions with Authorization: Bearer and the
-tools read_file, replace_text, run_checks, and finish. The socket timeout is
-60 seconds. The request log stores Bearer [redacted] and never the token.
-Parsing reads tool_calls off the first choice. This module does not choose
-an MCP server.
+tools read_file, replace_text, run_checks, and finish. A caller may append
+tools it already discovered. The socket timeout is 60 seconds. The request
+log stores Bearer [redacted] and never the token. Parsing reads tool_calls
+off the first choice. This module does not choose an MCP server or its argv.
 """
 
 from __future__ import annotations
@@ -189,6 +189,7 @@ class OpenAIChatLlm:
         model: str,
         transport: Transport,
         timeout_s: float = 60,
+        extra_tools: list[dict[str, object]] | None = None,
     ) -> None:
         """Bind the client to one endpoint.
 
@@ -198,12 +199,15 @@ class OpenAIChatLlm:
             model: Model name sent in the JSON body.
             transport: POST implementation. Live code passes UrllibTransport.
             timeout_s: Socket timeout. The default is 60 seconds.
+            extra_tools: Tools appended after the four built-ins. The caller
+                discovered them. This client does not choose an MCP argv.
         """
         self._url = base_url.rstrip("/") + "/chat/completions"
         self._api_key = api_key
         self._model = model
         self._transport = transport
         self._timeout_s = timeout_s
+        self._extra_tools = extra_tools or []
         self._posts = 0
         self.logs: list[str] = []
         self.tool_choice: str | None = None
@@ -232,7 +236,7 @@ class OpenAIChatLlm:
         payload: dict[str, object] = {
             "model": self._model,
             "messages": messages,
-            "tools": _TOOLS,
+            "tools": [*_TOOLS, *self._extra_tools] if self._extra_tools else _TOOLS,
         }
         if self.tool_choice:
             payload["tool_choice"] = {

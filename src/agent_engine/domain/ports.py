@@ -566,3 +566,21 @@ class StepLog(Protocol):
             ValueError: status is not completed or rejected.
         """
         ...  # pragma: no cover
+
+
+class McpCaller(Protocol):
+    """One stdio MCP call. The loop does not start the server itself."""
+
+    def call(self, server: str, tool: str, arguments: dict[str, object]) -> str:
+        """Run one namespaced tool and return its text.
+
+        Args:
+            server: Operator server name.
+            tool: Tool name inside that server.
+            arguments: Model arguments. The caller does not supply argv.
+
+        Returns:
+            Tool text, or a JSON error object. This method does not write
+            tasks.status.
+        """
+        ...  # pragma: no cover

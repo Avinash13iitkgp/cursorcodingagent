@@ -1,15 +1,16 @@
 """Scripted self-test procedures for the CLI gate.
 
 This module owns the fixed tenants, task id, worker ids, timestamps, the
-jail and edit checks, and the canned ReAct procedure for steps 1 through 4.
+jail and edit checks, and the canned ReAct procedure for steps 1 through 6.
 Step 5 delegates to the demos. It is not the product command path. A failed
 check raises. run_self_test turns that into PASS or FAIL. --live on step 4
-or step 5 calls the real model.
+or step 5 calls the real model. Step 6 stays offline.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import sys
@@ -51,6 +52,7 @@ def run_self_test(
         step: A single step number. Ignored as an upper bound when through is set.
         through: Run steps 1 through this number. Those procedures stay offline.
         live: When step 4 or step 5 is selected by itself, call the real model.
+            Step 6 stays on the canned echo tool.
 
     Returns:
         0 when the procedure prints PASS. 1 when it prints FAIL.
@@ -60,12 +62,12 @@ def run_self_test(
         print("self-test requires --step or --through", file=sys.stderr)
         return 1
     if through is not None:
-        if through < 1 or through > 5 or (step is not None and (step < 1 or step > through)):
+        if through < 1 or through > 6 or (step is not None and (step < 1 or step > through)):
             print("FAIL")
             print(f"step {through} is not implemented", file=sys.stderr)
             return 1
         steps = range(1, through + 1)
-    elif step not in (1, 2, 3, 4, 5):
+    elif step not in (1, 2, 3, 4, 5, 6):
         print("FAIL")
         print(f"step {step} is not implemented", file=sys.stderr)
         return 1
@@ -81,8 +83,10 @@ def run_self_test(
                 _run_step3(data_root)
             elif number == 4:
                 _run_step4(data_root, live=live and through is None)
-            else:
+            elif number == 5:
                 _run_step5(data_root, live=live and through is None)
+            else:
+                _run_step6(data_root)
     except (
         UnknownTenant,
         TenantMismatch,
@@ -290,6 +294,80 @@ def _run_step5(data_root: Path, *, live: bool) -> None:
         run_scenarios(data_root, (4, 6), llm="canned")
 
 
+def _run_step6(data_root: Path) -> None:
+    """Run the canned echo tool and keep the task running.
+
+    Args:
+        data_root: Directory that contains tenants/ and mcp.json.
+
+    The task id is mcp-echo. fix-adder is already completed when this
+    procedure follows step 4 on the same root.
+    """
+    _prepare_tenant(data_root, "acme")
+    _prepare_tenant(data_root, "globex")
+    init_task(data_root, TenantId("acme"), "mcp-echo")
+    echo = Path(__file__).resolve().parents[2] / "fixtures" / "mcp" / "echo_server.py"
+    catalog = {
+        "servers": [
+            {
+                "name": "echo",
+                "argv": ["python", str(echo)],
+                "env": [],
+            }
+        ]
+    }
+    (data_root / "mcp.json").write_text(json.dumps(catalog), encoding="utf-8")
+    saved = os.environ.get("AGENT_LLM_API_KEY")
+    os.environ.pop("AGENT_LLM_API_KEY", None)
+    try:
+        first = run_task(
+            data_root,
+            TenantId("acme"),
+            "mcp-echo",
+            llm="canned",
+            tool_choice="mcp__echo__ping",
+        )
+    finally:
+        if saved is None:
+            os.environ.pop("AGENT_LLM_API_KEY", None)
+        else:
+            os.environ["AGENT_LLM_API_KEY"] = saved
+    print(format_report(first))
+    _check_echo(data_root, first, saved)
+    sentinel = "mcp-step6-sentinel"
+    os.environ["AGENT_LLM_API_KEY"] = sentinel
+    try:
+        second = run_task(
+            data_root,
+            TenantId("acme"),
+            "mcp-echo",
+            llm="canned",
+            tool_choice="mcp__echo__ping",
+        )
+    finally:
+        if saved is None:
+            os.environ.pop("AGENT_LLM_API_KEY", None)
+        else:
+            os.environ["AGENT_LLM_API_KEY"] = saved
+    print(format_report(second))
+    _check_echo(data_root, second, sentinel)
+    if saved and saved in (second.detail or ""):
+        raise OSError("echo result contains AGENT_LLM_API_KEY")
+
+
+def _check_echo(data_root: Path, report, secret: str | None) -> None:
+    if report.status in ("completed", "rejected"):
+        raise OSError(f"mcp echo set tasks.status to {report.status}")
+    if "ping" not in report.detail:
+        raise OSError("echo result was not printed")
+    if secret and secret in report.detail:
+        raise OSError("echo result contains AGENT_LLM_API_KEY")
+    if get_task(data_root, TenantId("acme"), "mcp-echo").status in ("completed", "rejected"):
+        raise OSError("tasks.status became terminal")
+    if _message_count(data_root, "globex") != 0 or _step_count(data_root, "globex") != 0:
+        raise OSError("acme mcp call wrote globex")
+
+
 def _prepare_tenant(data_root: Path, tenant: str) -> None:
     provision(data_root, TenantId(tenant), tenant.capitalize())
 
@@ -320,6 +398,15 @@ def _step_count(data_root: Path, tenant: str) -> int:
     connection = open_tenant_db(data_root, TenantId(tenant), read_only=True)
     try:
         row = connection.execute("SELECT COUNT(*) AS n FROM step_intents").fetchone()
+    finally:
+        connection.close()
+    return int(row["n"])
+
+
+def _message_count(data_root: Path, tenant: str) -> int:
+    connection = open_tenant_db(data_root, TenantId(tenant), read_only=True)
+    try:
+        row = connection.execute("SELECT COUNT(*) AS n FROM messages").fetchone()
     finally:
         connection.close()
     return int(row["n"])

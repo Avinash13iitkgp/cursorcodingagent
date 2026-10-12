@@ -196,6 +196,7 @@ def loop(
     gate: StatusGate | Any,
     checks: CheckRunner,
     workspace: PlainWorkspace | None = None,
+    mcp: Any = None,
 ) -> ReactLoop:
     """Wire a loop around an already leased task.
 
@@ -205,6 +206,7 @@ def loop(
         gate: Finish gate.
         checks: Check runner.
         workspace: Work root. The default is a plain workspace.
+        mcp: Optional MCP port. None leaves mcp__ names unknown.
 
     Returns:
         A loop that uses OptimisticEditor.
@@ -221,4 +223,5 @@ def loop(
         OptimisticEditor(),
         checks,
         gate,
+        mcp,
     )

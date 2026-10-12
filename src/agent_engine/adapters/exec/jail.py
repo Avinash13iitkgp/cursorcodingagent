@@ -41,6 +41,7 @@ class Jail:
         cwd: Path,
         timeout_s: float,
         env: dict[str, str],
+        stdin: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run argv in its own process group.
 
@@ -49,6 +50,8 @@ class Jail:
             cwd: Working directory of the child.
             timeout_s: Seconds before the process group is killed.
             env: Exact environment of the child.
+            stdin: Text written to the child, then closed. None leaves stdin
+                inherited, which is the behavior of existing callers.
 
         Returns:
             The completed process when the command finishes in time.
@@ -68,10 +71,14 @@ class Jail:
             start_new_session=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            stdin=None if stdin is None else subprocess.PIPE,
             text=True,
         )
         try:
-            stdout, stderr = process.communicate(timeout=timeout_s)
+            if stdin is None:
+                stdout, stderr = process.communicate(timeout=timeout_s)
+            else:
+                stdout, stderr = process.communicate(stdin, timeout=timeout_s)
         except subprocess.TimeoutExpired:
             _kill_group(process)
             raise ToolTimeout(f"command exceeded {timeout_s}s") from None

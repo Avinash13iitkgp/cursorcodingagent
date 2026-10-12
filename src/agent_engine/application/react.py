@@ -7,7 +7,8 @@ call and commits before any file write or command. Extra tool calls in one
 message become later steps. T2 then writes the result, the cache row, and the
 transcript under the fence. The loop stops at 8 agent steps. finish does not
 set completed or rejected; VerifyGate is the only writer of those statuses.
-This module does not import sqlite or adapters.
+This module does not import sqlite or adapters. A name that starts with
+mcp__ is one step on the MCP port when that port is bound.
 """
 
 from __future__ import annotations
@@ -20,7 +21,15 @@ from typing import Protocol
 
 from agent_engine.domain.errors import StaleContent
 from agent_engine.domain.models import StepView, TenantId, TextEdit, ToolCall
-from agent_engine.domain.ports import CheckRunner, Clock, Editor, Llm, StepLog, Workspace
+from agent_engine.domain.ports import (
+    CheckRunner,
+    Clock,
+    Editor,
+    Llm,
+    McpCaller,
+    StepLog,
+    Workspace,
+)
 
 _MAX_STEPS = 8
 _TERMINAL = ("completed", "rejected")
@@ -39,6 +48,7 @@ class RunResult:
     cache_hit: bool
     executions: int
     posts: int
+    detail: str = ""
 
 
 class FinishGate(Protocol):
@@ -98,6 +108,7 @@ class ReactLoop:
         editor: Editor,
         checks: CheckRunner,
         gate: FinishGate,
+        mcp: McpCaller | None = None,
     ) -> None:
         """Bind the loop to one lease.
 
@@ -113,6 +124,7 @@ class ReactLoop:
             editor: Optimistic edit port.
             checks: run_checks runner. It does not set task status.
             gate: Writer of completed and rejected. The loop does not set them.
+            mcp: MCP port. None leaves mcp__ names as an unknown tool.
         """
         self._tenant_id = tenant_id
         self._task_id = task_id
@@ -125,6 +137,8 @@ class ReactLoop:
         self._editor = editor
         self._checks = checks
         self._gate = gate
+        self._mcp = mcp
+        self._detail = ""
         self._instant = lambda: 0.0
 
     def run(
@@ -241,6 +255,8 @@ class ReactLoop:
         elif step.tool_name == "finish":
             status = self._gate.finish(now)
             result = json.dumps({"status": status})
+        elif step.tool_name.startswith("mcp__"):
+            result = self._mcp_call(step.tool_name, args)
         else:
             result = json.dumps({"error": "unknown tool"})
         body = json.dumps({"tool_call_id": f"call-{step.step_index}", "content": result})
@@ -255,6 +271,16 @@ class ReactLoop:
             now,
             (("tool", body),),
         )
+
+    def _mcp_call(self, name: str, args: dict[str, object]) -> str:
+        if self._mcp is None or not isinstance(args, dict):
+            return json.dumps({"error": "unknown tool"})
+        parts = name.split("__", 2)
+        if len(parts) < 3 or not parts[1] or not parts[2]:
+            return json.dumps({"error": "unknown tool"})
+        result = self._mcp.call(parts[1], parts[2], args)
+        self._detail = result
+        return result
 
     def _read_file(self, path: str) -> str:
         data = self._workspace.read(path)
@@ -320,4 +346,6 @@ class ReactLoop:
         return history
 
     def _result(self, status: str, cache_hit: bool, executions: int) -> RunResult:
-        return RunResult(status, cache_hit, executions, self._llm.post_count())
+        return RunResult(
+            status, cache_hit, executions, self._llm.post_count(), self._detail
+        )

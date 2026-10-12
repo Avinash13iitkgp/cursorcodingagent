@@ -2,7 +2,7 @@
 
 Local, multi-process coding-agent engine. Each tenant has its own SQLite database and workspace directory. A fencing token makes a stale worker unable to commit. The worker calls an OpenAI-compatible Chat Completions API with a token you provide.
 
-The build is seven steps, specified in [plan.md](plan.md). Do not start a step until the previous step's pytest gate and `self-test` gate both pass. This guide is the setup and test map. Steps 1 through 5 are implemented: `provision`, `init-task`, `pragma`, `acquire`, `renew`, `release`, `show-lease`, `jail`, `replace`, `run-task`, `demo`, and `self-test` through step 5. Steps 6 and 7 stay specified in `plan.md`. Step 6 is MCP tool calls. Step 7 is the context builder.
+The build is seven steps, specified in [plan.md](plan.md). Do not start a step until the previous step's pytest gate and `self-test` gate both pass. This guide is the setup and test map. Steps 1 through 6 are implemented: `provision`, `init-task`, `pragma`, `acquire`, `renew`, `release`, `show-lease`, `jail`, `replace`, `run-task`, `demo`, MCP tool calls, and `self-test` through step 6. Step 7, the context builder, stays specified in `plan.md`.
 
 ## Requirements
 
@@ -134,6 +134,32 @@ python -m agent_engine --data-root /tmp/agent-demo run-task --tenant acme --task
 
 `completed` is written only after the external verifier passes. A `finish` tool call from the model does not set that status by itself. The verifier runs `checks/commands` in the jail. The Python fixture compiles the work tree and runs `checks/test_adder.py` with `PYTHONPATH` pointed at that tree.
 
+### MCP tools
+
+The model is always offered four built-in tools: `read_file`, `replace_text`, `run_checks`, and `finish`. MCP tools are extra. They come from `{data-root}/mcp.json`. With that file absent, nothing is discovered, and a name that starts with `mcp__` is stored as `{"error": "unknown tool"}`.
+
+The repo ships one stdio server, `fixtures/mcp/echo_server.py`. It lists one tool:
+
+| Server | Tool | Name the model calls | Arguments | Result |
+| --- | --- | --- | --- | --- |
+| `echo` | `ping` | `mcp__echo__ping` | `{"text": "..."}` | JSON text with that `text` and `has_api_key`. The secret value is left out. |
+
+`self-test --step 6` writes the catalog below and runs canned `mcp__echo__ping` on task `mcp-echo`. It prints the echo text. The task stays `running`. The task id is `mcp-echo` so a completed `fix-adder` on the same root is left alone. To offer the same tool to a normal `run-task`, put this next to the data root:
+
+```json
+{
+  "servers": [
+    {
+      "name": "echo",
+      "argv": ["python", "fixtures/mcp/echo_server.py"],
+      "env": []
+    }
+  ]
+}
+```
+
+Each entry has `name`, `argv`, and an optional `env` list of variable names. The model cannot add a server or change that argv. A discovered tool is one ReAct step named `mcp__{server}__{tool}`. The engine starts the server with `Jail.run` in the task work root, with a 30 second timeout, once for `tools/list` and again for each `tools/call`. The session is `initialize`, `notifications/initialized`, then that method. The process exits when stdin closes. `AGENT_LLM_API_KEY` is copied only when that entry lists the name. An MCP result does not set `completed` or `rejected`.
+
 ## 8. CLI test gates
 
 Unit tests and the CLI self-test are both required.
@@ -167,6 +193,14 @@ python -m pytest tests/test_cow_rollback.py tests/test_demo_crash.py tests/test_
 python -m agent_engine self-test --step 5 --data-root /tmp/agent-step5
 python -m agent_engine self-test --step 5 --live --data-root /tmp/agent-step5-live
 python -m agent_engine demo --data-root /tmp/agent-step5-live --tenant acme --all
+```
+
+Step 6 offline. No token, and no network:
+
+```bash
+python -m pytest tests/test_mcp_tools.py tests/test_cli_step6.py -q --cov=agent_engine.adapters.mcp.client --cov-fail-under=85
+python -m agent_engine self-test --step 6 --data-root /tmp/agent-step6
+python -m agent_engine self-test --through 6 --data-root /tmp/agent-step6
 ```
 
 `self-test` prints `PASS` or `FAIL` and exits 0 only when the procedure passes. `--through N` runs the offline procedures for steps 1 through N. `--live` is what turns on the real API.
@@ -213,6 +247,7 @@ That count is `0`.
 | CLI gate for one step | `self-test --step N --data-root DIR` |
 | CLI gate through step N | `self-test --through N --data-root DIR` |
 | Live CLI gate | `self-test --step N --live --data-root DIR` |
+| Echo an MCP tool | `self-test --step 6` |
 | All six demos | `demo --tenant acme --all` |
 
 Prefix tenant commands with `--data-root` when you are not using `./var`.

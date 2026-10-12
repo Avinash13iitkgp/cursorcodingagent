@@ -17,6 +17,7 @@ import uuid
 from pathlib import Path
 
 from agent_engine.adapters.exec.jail import Jail
+from agent_engine.adapters.mcp.client import McpClient
 from agent_engine.adapters.llm.openai_chat import (
     CannedTransport,
     OpenAIChatLlm,
@@ -54,6 +55,8 @@ def format_report(report: RunResult) -> str:
         lines.append("cache hit")
         lines.append(f"executions={report.executions}")
         lines.append(f"posts={report.posts}")
+    if report.detail:
+        lines.append(report.detail)
     return "\n".join(lines)
 
 
@@ -102,7 +105,8 @@ def run_task(
         service = LeaseService(tenant_id, SqliteLeaseStore(connection), SystemClock())
         lease = service.acquire(task_id, worker_id, now, _TTL)
         try:
-            model = _llm(data_root, tenant_id, work, llm, tool_choice)
+            mcp = McpClient(data_root, Jail(), work)
+            model = _llm(data_root, tenant_id, work, llm, tool_choice, mcp.chat_tools())
             store = SqliteStepStore(connection)
             checks = ExternalVerifier(data_root / "checks", Jail())
             loop = ReactLoop(
@@ -125,6 +129,7 @@ def run_task(
                     checks,
                     store,
                 ),
+                mcp,
             )
             return loop.run(now, clock=SystemClock())
         finally:
@@ -142,6 +147,7 @@ def _llm(
     work: Path,
     llm: str,
     tool_choice: str | None,
+    extra_tools: list[dict[str, object]] | None = None,
 ) -> OpenAIChatLlm:
     if llm == "canned":
         return OpenAIChatLlm(
@@ -149,10 +155,11 @@ def _llm(
             "canned-token",
             "canned",
             CannedTransport(_canned_bodies(work, tool_choice)),
+            extra_tools=extra_tools,
         )
     tenant = read_tenant(data_root, tenant_id)
     api_key, base_url, model = _live_credentials(tenant.llm_api_key_env)
-    return OpenAIChatLlm(base_url, api_key, model, UrllibTransport())
+    return OpenAIChatLlm(base_url, api_key, model, UrllibTransport(), extra_tools=extra_tools)
 
 
 def _live_credentials(env_name: str) -> tuple[str, str, str]:
@@ -166,6 +173,11 @@ def _live_credentials(env_name: str) -> tuple[str, str, str]:
 def _canned_bodies(work: Path, tool_choice: str | None) -> list[dict[str, object]]:
     if tool_choice == "finish":
         return [completion_body([("finish", "{}")])]
+    if tool_choice and tool_choice.startswith("mcp__"):
+        return [
+            completion_body([(tool_choice, json.dumps({"text": "ping"}))]),
+            completion_body([]),
+        ]
     digest = hashlib.sha256((work / "adder.py").read_bytes()).hexdigest()
     replace = json.dumps(
         {
