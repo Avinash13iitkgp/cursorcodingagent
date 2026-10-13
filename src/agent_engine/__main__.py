@@ -11,7 +11,7 @@ prompt, prints the tree, and waits for a yes on stdin before it builds
 anything.
 demo starts the scenarios. The scripted self-test procedure lives in agent_engine.self_test.
 Invalid ids, tenant boundary errors, lease errors, a plan that is not
-accepted, and edit errors exit non-zero.
+accepted, transport errors, and edit errors exit non-zero.
 """
 
 from __future__ import annotations
@@ -212,6 +212,7 @@ def main(argv: list[str] | None = None) -> int:
         AmbiguousEdit,
         ToolTimeout,
         ValueError,
+        OSError,
     ) as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1

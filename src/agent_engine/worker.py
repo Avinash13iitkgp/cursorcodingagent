@@ -71,6 +71,7 @@ class WorkerConfig:
     resume_only: bool = False
     force_finish_after_stale: bool = False
     heartbeat_interval: float | None = None
+    max_steps: int = 8
 
 
 @dataclass
@@ -416,6 +417,7 @@ class Worker:
                 mcp,
                 builder,
                 os.environ.get("AGENT_LLM_API_KEY", ""),
+                max_steps=self.config.max_steps,
             )
             try:
                 result = loop.run(now, clock=SystemClock(), resume_only=self.config.resume_only)
@@ -578,6 +580,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--llm", choices=("canned", "live"), default="canned")
     parser.add_argument("--ttl", type=float, default=180.0)
     parser.add_argument("--tool-choice")
+    parser.add_argument("--max-steps", type=int, default=8)
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     ready = os.environ.get("AGENT_READY_FILE")
     release = os.environ.get("AGENT_RELEASE_FILE")
@@ -599,6 +602,7 @@ def main(argv: list[str] | None = None) -> int:
             release_file=Path(release) if release else None,
             resume_only=os.environ.get("AGENT_RESUME_ONLY") == "1",
             force_finish_after_stale=os.environ.get("AGENT_FORCE_FINISH_AFTER_STALE") == "1",
+            max_steps=args.max_steps,
         )
     )
     _print_report(report)
