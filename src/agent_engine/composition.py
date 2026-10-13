@@ -46,6 +46,7 @@ from agent_engine.adapters.sqlite.tenant_store import (
 from agent_engine.adapters.verifier.external import ExternalVerifier
 from agent_engine.adapters.workspace.cow import CowWorkspace
 from agent_engine.adapters.workspace.edits import OptimisticEditor
+from agent_engine.adapters.workspace.plain import PlainWorkspace
 from agent_engine.application.leases import LeaseService, SystemClock
 from agent_engine.application.plan import (
     PlanSession,
@@ -53,7 +54,7 @@ from agent_engine.application.plan import (
     load_plan,
     pinned_plan,
     plan_body,
-    render_tree,
+    render_plan,
     task_slug,
 )
 from agent_engine.application.react import ReactLoop, RunResult
@@ -68,9 +69,36 @@ _TEST_PATH = "services/api/tests/test_app.py"
 _CANNED_PLAN = json.dumps(
     {
         "summary": "Create the api package and its test.",
+        "approach": (
+            "Create services/api/app.py with write_file, then the pytest module "
+            "with write_file, then run the operator checks and finish."
+        ),
+        "steps": [
+            {
+                "title": "Create the api module",
+                "detail": (
+                    "Call write_file on services/api/app.py. Define add(a, b) "
+                    "and return a + b. Parent directories are created with the file."
+                ),
+            },
+            {
+                "title": "Create the test module",
+                "detail": (
+                    "Call write_file on services/api/tests/test_app.py. Import add "
+                    "from services.api.app and assert add(1, 2) == 3."
+                ),
+            },
+            {
+                "title": "Run checks and finish",
+                "detail": (
+                    "Call run_checks. The operator command list is the gate. "
+                    "Then call finish so the verifier can mark the task."
+                ),
+            },
+        ],
         "files": [
             {"path": _APP_PATH, "action": "create", "detail": "add(a, b) returns a + b"},
-            {"path": _TEST_PATH, "action": "create", "detail": "test add"},
+            {"path": _TEST_PATH, "action": "create", "detail": "test add(1, 2) == 3"},
         ],
     }
 )
@@ -254,7 +282,8 @@ def propose_plan(
         llm: canned returns the fixed plan. Any other value is the live adapter.
 
     Returns:
-        The planned paths as a tree. No lease is taken and no file is written.
+        The execution plan: approach, steps, and the file tree. No lease is
+        taken and no file is written. An existing tree may be read.
 
     Raises:
         UnknownTenant: The tenant database does not exist.
@@ -266,14 +295,15 @@ def propose_plan(
     task = get_task(data_root, tenant_id, task_id)
     if task.status in _TERMINAL:
         raise ValueError(f"{task_id} is {task.status}")
-    model = _plan_llm(data_root, tenant_id, llm)
-    plan = PlanSession(model).propose(prompt)
+    codebase = _existing_code(data_root, tenant_id, task.workspace_root)
+    model = _plan_llm(data_root, tenant_id, llm, explore=codebase is not None)
+    plan = PlanSession(model, codebase=codebase).propose(prompt)
     connection = open_tenant_db(data_root, tenant_id)
     try:
         SqlitePlanStore(connection).propose(tenant_id, task_id, prompt, plan_body(plan))
     finally:
         connection.close()
-    return render_tree(plan)
+    return render_plan(plan)
 
 
 def accept_plan(data_root: Path, tenant_id: TenantId, task_id: str) -> None:
@@ -316,7 +346,7 @@ def show_plan(data_root: Path, tenant_id: TenantId, task_id: str) -> str:
     """
     prompt, body, status = _read_plan(data_root, tenant_id, task_id)
     plan = load_plan(body)
-    return "\n".join([f"prompt={prompt}", f"status={status}", render_tree(plan)])
+    return "\n".join([f"prompt={prompt}", f"status={status}", render_plan(plan)])
 
 
 def apply_plan(
@@ -454,17 +484,38 @@ def _read_plan(data_root: Path, tenant_id: TenantId, task_id: str) -> tuple[str,
     return stored
 
 
-def _plan_llm(data_root: Path, tenant_id: TenantId, llm: str) -> OpenAIChatLlm:
+def _existing_code(data_root: Path, tenant_id: TenantId, workspace_root: str) -> PlainWorkspace | None:
+    task_dir = resolve_tenant_dir(data_root, tenant_id) / workspace_root
+    for name in ("work", "base"):
+        root = task_dir / name
+        if _has_source(root):
+            return PlainWorkspace(root)
+    return None
+
+
+def _has_source(root: Path) -> bool:
+    if not root.is_dir():
+        return False
+    for path in root.rglob("*"):
+        if path.is_file() and not path.is_symlink() and path.suffix != ".tmp":
+            return True
+    return False
+
+
+def _plan_llm(
+    data_root: Path, tenant_id: TenantId, llm: str, *, explore: bool = False
+) -> OpenAIChatLlm:
     if llm == "canned":
         return OpenAIChatLlm(
             "http://canned.invalid",
             "canned-token",
             "canned",
             CannedTransport([completion_body([("submit_plan", _CANNED_PLAN)])]),
+            explore=explore,
         )
     tenant = read_tenant(data_root, tenant_id)
     api_key, base_url, model = _live_credentials(tenant.llm_api_key_env)
-    return OpenAIChatLlm(base_url, api_key, model, UrllibTransport())
+    return OpenAIChatLlm(base_url, api_key, model, UrllibTransport(), explore=explore)
 
 
 def _llm(

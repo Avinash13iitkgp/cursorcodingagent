@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -122,6 +123,7 @@ class ReactLoop:
         secret: str = "",
         prompt: str | None = None,
         max_steps: int = _MAX_STEPS,
+        trace: Callable[[str], None] | None = None,
     ) -> None:
         """Bind the loop to one lease.
 
@@ -145,6 +147,9 @@ class ReactLoop:
                 run-task and the demos use.
             max_steps: Agent steps this run may reach. apply passes a larger
                 cap so a small tree fits in one run.
+            trace: Receives one log line per model turn and per tool result.
+                None stays quiet, which run-task's library callers and the
+                demos rely on.
         """
         self._tenant_id = tenant_id
         self._task_id = task_id
@@ -162,6 +167,7 @@ class ReactLoop:
         self._secret = secret
         self._prompt = _PROMPT if prompt is None else prompt
         self._max_steps = max_steps
+        self._trace = trace
         self._detail = ""
         self._instant = lambda: 0.0
 
@@ -202,6 +208,7 @@ class ReactLoop:
             if status in _TERMINAL:
                 return self._result(status, True, executions)
             if self._store.agent_count(self._tenant_id, self._task_id) >= self._max_steps:
+                self._note(f"model: stopped at {self._max_steps} steps")
                 return self._result(status, False, executions)
             if not self._prepare_next():
                 return self._result(status, False, executions)
@@ -213,10 +220,17 @@ class ReactLoop:
             history = self._context.pack(
                 self._tenant_id, self._task_id, self._history()
             )
+            done = self._store.agent_count(self._tenant_id, self._task_id)
+            self._note(f"model: asking for the next action ({done} steps done)")
             calls = self._llm.complete(history)
             if not calls:
+                self._note("model: no tool call, stopping")
                 return False
+            for call in calls:
+                self._note(f"model chose {call.name}\n{_shown(call.arguments_json, self._secret)}")
             queued, messages = self._lead_call(calls)
+        else:
+            self._note(f"model: queued {queued.name}\n{_shown(queued.arguments_json, self._secret)}")
         now = self._instant()
         self._store.mark_running(
             self._tenant_id, self._task_id, self._worker_id, self._token, now
@@ -271,6 +285,10 @@ class ReactLoop:
         self._store.mark_running(
             self._tenant_id, self._task_id, self._worker_id, self._token, now
         )
+        self._note(
+            f"step {step.step_index}: {step.tool_name}\n"
+            f"{_shown(step.args_json, self._secret)}"
+        )
         args = json.loads(step.args_json)
         knowledge = None
         if step.tool_name == "read_file":
@@ -296,6 +314,7 @@ class ReactLoop:
         else:
             result = json.dumps({"error": "unknown tool"})
         result = redact(result, self._secret)
+        self._note(f"step {step.step_index} result:\n{result}")
         safe_args = args if isinstance(args, dict) else {}
         safe_args = json.loads(redact(json.dumps(safe_args), self._secret))
         trajectory = list(_trajectory(step.tool_name, step.step_index, safe_args, result))
@@ -439,10 +458,23 @@ class ReactLoop:
             history.append(payload)
         return history
 
+    def _note(self, text: str) -> None:
+        if self._trace is not None:
+            self._trace(text)
+
     def _result(self, status: str, cache_hit: bool, executions: int) -> RunResult:
         return RunResult(
             status, cache_hit, executions, self._llm.post_count(), self._detail
         )
+
+
+def _shown(args_json: str, secret: str) -> str:
+    text = redact(args_json, secret)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    return json.dumps(parsed, indent=2)
 
 
 def _guard_new_path(relative_path: str) -> None:

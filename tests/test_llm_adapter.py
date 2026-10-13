@@ -79,6 +79,60 @@ def test_plan_sends_submit_plan_as_the_only_tool() -> None:
     assert llm.post_count() == 1
 
 
+def test_explore_plan_offers_search_tools_and_not_writes() -> None:
+    """An existing tree adds the read tools and does not force submit_plan."""
+    transport = _Capture(completion_body([("list_files", json.dumps({"path": "."}))]))
+    llm = OpenAIChatLlm(
+        "https://example.test/v1", "token", "demo-model", transport, explore=True
+    )
+    calls = llm.plan([{"role": "user", "content": "extend the api"}])
+    request = json.loads(transport.body)
+    names = [item["function"]["name"] for item in request["tools"]]
+    assert names == ["read_file", "list_files", "search_text", "submit_plan"]
+    assert request["tool_choice"] == "required"
+    assert calls[0].name == "list_files"
+    heard: list[str] = []
+    streamed = _Lines(
+        [
+            'data: {"choices":[{"delta":{"reasoning_content":"Look at "}}]}\n',
+            'data: {"choices":[{"delta":{"reasoning_content":"app.py."}}]}\n',
+            ": keep-alive\n",
+            "data: not-json\n",
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":""}}]}}]}\n',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"path\\":\\"app.py\\"}"}}]}}]}\n',
+            "data: [DONE]\n",
+        ]
+    )
+    live = OpenAIChatLlm(
+        "https://example.test/v1",
+        "token",
+        "demo-model",
+        streamed,
+        explore=True,
+        on_text=heard.append,
+    )
+    streamed_calls = live.plan([{"role": "user", "content": "extend the api"}])
+    assert "".join(heard) == "Look at app.py."
+    assert streamed_calls[0].name == "read_file"
+    assert json.loads(streamed_calls[0].arguments_json) == {"path": "app.py"}
+    assert json.loads(streamed.body)["stream"] is True
+
+
+class _Lines:
+    """Yield scripted SSE lines. post is not used."""
+
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+        self.body = b""
+
+    def iter_lines(
+        self, url: str, headers: dict[str, str], body: bytes, timeout_s: float
+    ) -> list[str]:
+        del url, headers, timeout_s
+        self.body = body
+        return self._lines
+
+
 def test_llm_log_redacts_bearer_token() -> None:
     """The request log keeps the URL and replaces the bearer token."""
     secret = "example.test"

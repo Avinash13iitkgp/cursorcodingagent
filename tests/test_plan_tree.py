@@ -9,6 +9,7 @@ import pytest
 
 from agent_engine.__main__ import main
 from agent_engine.adapters.sqlite.tenant_store import init_task, provision
+from agent_engine.adapters.workspace.plain import PlainWorkspace
 from agent_engine.application.plan import (
     PlanSession,
     apply_prompt,
@@ -250,11 +251,8 @@ def test_write_file_rejects_a_non_object_argument(tmp_path: Path) -> None:
 
 
 def test_validate_plan_rejects_bad_bodies() -> None:
-    """A plan needs a summary, at least one file, a safe path, and an action."""
-    good = {
-        "summary": "Create the api package.",
-        "files": [{"path": APP, "action": "create", "detail": "add"}],
-    }
+    """A plan needs a summary, steps, at least one file, a safe path, and an action."""
+    good = _plan_payload()
     plan = validate_plan(good)
     assert plan.files[0].path == APP
     assert load_plan(plan_body(plan)) == plan
@@ -286,14 +284,13 @@ def test_validate_plan_rejects_bad_bodies() -> None:
 def test_render_tree_nests_directories_before_files() -> None:
     """The tree prints one line per level with directories first."""
     plan = validate_plan(
-        {
-            "summary": "ok",
-            "files": [
-                {"path": "README.md", "action": "create"},
+        _plan_payload(
+            files=[
+                {"path": "README.md", "action": "create", "detail": "what this repo is"},
                 {"path": APP, "action": "create", "detail": "add"},
-                {"path": TEST, "action": "edit"},
-            ],
-        }
+                {"path": TEST, "action": "edit", "detail": "cover add"},
+            ]
+        )
     )
     assert render_tree(plan).splitlines() == [
         "services/",
@@ -312,7 +309,7 @@ def test_render_tree_nests_directories_before_files() -> None:
 
 def test_plan_session_offers_only_submit_plan() -> None:
     """The session refuses an empty prompt, another tool, and bad arguments."""
-    body = json.dumps({"summary": "ok", "files": [{"path": APP, "action": "create"}]})
+    body = json.dumps(_plan_payload(summary="ok"))
     planner = _Planner([(ToolCall("submit_plan", body, "plan-0"),)])
     plan = PlanSession(planner).propose(PROMPT)
     assert plan.summary == "ok"
@@ -326,6 +323,67 @@ def test_plan_session_offers_only_submit_plan() -> None:
     ):
         with pytest.raises(ValueError):
             PlanSession(_Planner([turn])).propose(PROMPT)
+
+
+def test_plan_session_reads_an_existing_tree_and_does_not_write(tmp_path: Path) -> None:
+    """Lookups run against the tree. write_file is refused and creates nothing."""
+    (tmp_path / "app.py").write_text("marker-in-tree\n", encoding="utf-8")
+    planner = _Planner(
+        [
+            (
+                call("list_files", {"path": "."}),
+                call("search_text", {"query": "marker-in-tree", "path": "."}),
+                call("write_file", {"path": "extra.py", "content": "nope"}),
+            ),
+            (ToolCall("submit_plan", json.dumps(_plan_payload()), "plan-final"),),
+        ]
+    )
+    notes: list[str] = []
+    plan = PlanSession(planner, trace=notes.append, codebase=PlainWorkspace(tmp_path)).propose(
+        PROMPT
+    )
+    sent = json.dumps(planner.seen[1])
+    assert plan.files[0].path == APP
+    assert "app.py" in sent
+    assert "marker-in-tree" in sent
+    assert "planning cannot write" in sent
+    assert not (tmp_path / "extra.py").exists()
+    assert planner.seen[0][0]["content"].startswith("The work tree already")
+    assert any(line.startswith("planning: list_files") for line in notes)
+    assert any(line.startswith("planning: search_text") for line in notes)
+
+
+def test_plan_lookup_rejects_a_path_outside_the_tree(tmp_path: Path) -> None:
+    """A lookup outside the tree is an error result and writes nothing."""
+    (tmp_path / "app.py").write_text("keep\n", encoding="utf-8")
+    planner = _Planner(
+        [
+            (call("read_file", {"path": "../secret.txt"}),),
+            (ToolCall("submit_plan", json.dumps(_plan_payload()), "plan-final"),),
+        ]
+    )
+    plan = PlanSession(planner, codebase=PlainWorkspace(tmp_path)).propose(PROMPT)
+    assert plan.summary == "Create the api package."
+    assert "ValueError" in json.dumps(planner.seen[1])
+    assert not (tmp_path.parent / "secret.txt").exists()
+
+
+def _plan_payload(
+    files: list[dict[str, str]] | None = None, summary: str = "Create the api package."
+) -> dict[str, object]:
+    return {
+        "summary": summary,
+        "approach": "Create the module with write_file, then the test, then run checks.",
+        "steps": [
+            {
+                "title": "Create the module",
+                "detail": "write_file services/api/app.py with add.",
+            }
+        ],
+        "files": files
+        if files is not None
+        else [{"path": APP, "action": "create", "detail": "add returns a + b"}],
+    }
 
 
 class _Planner:

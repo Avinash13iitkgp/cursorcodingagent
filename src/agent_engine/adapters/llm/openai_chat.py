@@ -4,9 +4,11 @@ complete POSTs {base_url}/chat/completions with Authorization: Bearer and the
 tools read_file, replace_text, write_file, run_checks, and finish. A caller
 may append tools it already discovered. plan POSTs the same endpoint with
 submit_plan as the only tool, so a planning turn cannot answer with a file
-tool. The socket timeout is 60 seconds. The request log stores Bearer
-[redacted] and never the token. Parsing reads tool_calls off the first
-choice. This module does not choose an MCP server or its argv.
+tool. When a text listener is set and the transport can stream, the request
+sets stream and reasoning tokens are handed to that listener as they arrive.
+The socket timeout is 60 seconds. The request log stores Bearer [redacted]
+and never the token. Parsing reads tool_calls off the first choice. This
+module does not choose an MCP server or its argv.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import json
 import threading
 import urllib.request
+from collections.abc import Callable, Iterator
 from typing import Protocol
 
 from agent_engine.domain.models import ToolCall
@@ -123,16 +126,33 @@ _TOOLS = [
     },
 ]
 
+_LOOK_NAMES = ("list_files", "search_text", "read_file")
+_LOOK_TOOLS = [
+    tool for tool in _TOOLS if tool["function"]["name"] in _LOOK_NAMES  # type: ignore[index]
+]
+
 _PLAN_TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "submit_plan",
-            "description": "Submit the file list for this prompt. It writes nothing.",
+            "description": "Submit the execution plan for this prompt. It writes nothing.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "summary": {"type": "string"},
+                    "approach": {"type": "string"},
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "detail": {"type": "string"},
+                            },
+                            "required": ["title", "detail"],
+                        },
+                    },
                     "files": {
                         "type": "array",
                         "items": {
@@ -142,11 +162,11 @@ _PLAN_TOOLS = [
                                 "action": {"type": "string", "enum": ["create", "edit"]},
                                 "detail": {"type": "string"},
                             },
-                            "required": ["path", "action"],
+                            "required": ["path", "action", "detail"],
                         },
                     },
                 },
-                "required": ["summary", "files"],
+                "required": ["summary", "approach", "steps", "files"],
             },
         },
     }
@@ -222,6 +242,41 @@ class UrllibTransport:
             if closer is not None:
                 closer()
 
+    def iter_lines(
+        self, url: str, headers: dict[str, str], body: bytes, timeout_s: float
+    ) -> Iterator[str]:
+        """POST body and yield each response line.
+
+        Args:
+            url: Absolute chat completions URL.
+            headers: Request headers.
+            body: JSON body. The caller sets stream on it.
+            timeout_s: Socket timeout passed to urlopen.
+
+        Returns:
+            An iterator of decoded lines, including the line ending the
+            server sent.
+
+        Raises:
+            urllib.error.URLError: The socket failed or the status is an error.
+        """
+        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        response = urllib.request.urlopen(request, timeout=timeout_s)
+        with self._lock:
+            self._response = response
+        try:
+            while True:
+                raw = response.readline()
+                if not raw:
+                    break
+                yield raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+        finally:
+            with self._lock:
+                self._response = None
+            closer = getattr(response, "close", None)
+            if closer is not None:
+                closer()
+
 
 class CannedTransport:
     """Return scripted chat bodies and record posts. It does not use the network."""
@@ -258,6 +313,24 @@ class CannedTransport:
             raise ValueError("canned transport has no body left")
         return json.dumps(self._bodies.pop(0)).encode("utf-8")
 
+    def iter_lines(
+        self, url: str, headers: dict[str, str], body: bytes, timeout_s: float
+    ) -> Iterator[str]:
+        """Yield the next canned body as one SSE data line.
+
+        Args:
+            url: Recorded by post.
+            headers: Recorded by post.
+            body: Recorded by post.
+            timeout_s: Ignored. Canned replies do not wait.
+
+        Returns:
+            The next body wrapped as ``data:``, then ``data: [DONE]``.
+        """
+        raw = self.post(url, headers, body, timeout_s).decode("utf-8")
+        yield f"data: {raw}\n"
+        yield "data: [DONE]\n"
+
     def close(self) -> None:
         """No socket to close. The canned transport does not dial out.
 
@@ -278,6 +351,8 @@ class OpenAIChatLlm:
         transport: Transport,
         timeout_s: float = 60,
         extra_tools: list[dict[str, object]] | None = None,
+        on_text: Callable[[str], None] | None = None,
+        explore: bool = False,
     ) -> None:
         """Bind the client to one endpoint.
 
@@ -289,6 +364,12 @@ class OpenAIChatLlm:
             timeout_s: Socket timeout. The default is 60 seconds.
             extra_tools: Tools appended after the four built-ins. The caller
                 discovered them. This client does not choose an MCP argv.
+            on_text: Receives reasoning and assistant text. When set, and the
+                transport has iter_lines, the request streams. None leaves the
+                call on a single response body.
+            explore: When true, plan also offers list_files, search_text, and
+                read_file and does not force submit_plan. A new project leaves
+                this false.
         """
         self._url = base_url.rstrip("/") + "/chat/completions"
         self._api_key = api_key
@@ -296,6 +377,8 @@ class OpenAIChatLlm:
         self._transport = transport
         self._timeout_s = timeout_s
         self._extra_tools = extra_tools or []
+        self._on_text = on_text
+        self._explore = explore
         self._posts = 0
         self.logs: list[str] = []
         self.tool_choice: str | None = None
@@ -320,7 +403,6 @@ class OpenAIChatLlm:
         Raises:
             ValueError: The body is not a chat completion with a message.
         """
-        self._posts += 1
         payload: dict[str, object] = {
             "model": self._model,
             "messages": messages,
@@ -331,46 +413,56 @@ class OpenAIChatLlm:
                 "type": "function",
                 "function": {"name": self.tool_choice},
             }
-        body = json.dumps(payload).encode("utf-8")
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
-        self._log(headers, body)
-        raw = self._transport.post(self._url, headers, body, self._timeout_s)
-        return _parse_calls(raw)
+        return self._post_turn(payload)
 
     def plan(self, messages: list[dict[str, object]]) -> tuple[ToolCall, ...]:
-        """POST one planning turn that offers submit_plan and no file tool.
+        """POST one planning turn. An existing tree may be searched first.
 
         Args:
             messages: Planning prompt in Chat Completions shape.
 
         Returns:
-            Tool calls from the first choice. read_file, write_file, and
-            replace_text are not sent, so the model cannot name them.
+            Tool calls from the first choice. write_file, replace_text,
+            run_checks, and finish are not sent. explore adds list_files,
+            search_text, and read_file, and requires some tool instead of
+            forcing submit_plan.
 
         Raises:
             ValueError: The body is not a chat completion with a message.
         """
-        self._posts += 1
-        payload: dict[str, object] = {
-            "model": self._model,
-            "messages": messages,
-            "tools": _PLAN_TOOLS,
-            "tool_choice": {
+        payload: dict[str, object] = {"model": self._model, "messages": messages}
+        if self._explore:
+            payload["tools"] = [*_LOOK_TOOLS, *_PLAN_TOOLS]
+            payload["tool_choice"] = "required"
+        else:
+            payload["tools"] = _PLAN_TOOLS
+            payload["tool_choice"] = {
                 "type": "function",
                 "function": {"name": "submit_plan"},
-            },
-        }
+            }
+        return self._post_turn(payload)
+
+    def _post_turn(self, payload: dict[str, object]) -> tuple[ToolCall, ...]:
+        self._posts += 1
+        streamer = getattr(self._transport, "iter_lines", None)
+        if self._on_text is not None and streamer is not None:
+            payload = dict(payload)
+            payload["stream"] = True
         body = json.dumps(payload).encode("utf-8")
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
         self._log(headers, body)
+        if self._on_text is not None and streamer is not None:
+            return _read_stream(
+                streamer(self._url, headers, body, self._timeout_s), self._on_text
+            )
         raw = self._transport.post(self._url, headers, body, self._timeout_s)
-        return _parse_calls(raw)
+        text, calls = _parse_message(raw)
+        if self._on_text is not None and text:
+            self._on_text(text)
+        return calls
 
     def summarize(self, messages: list[dict[str, object]]) -> str:
         """POST one tool-free completion and return the assistant text.
@@ -422,20 +514,97 @@ class OpenAIChatLlm:
             closer()
 
 
-def _parse_calls(raw: bytes) -> tuple[ToolCall, ...]:
+def _parse_message(raw: bytes) -> tuple[str, tuple[ToolCall, ...]]:
     try:
         payload = json.loads(raw)
         message = payload["choices"][0]["message"]
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError("chat completion is missing a message") from exc
+    if not isinstance(message, dict):
+        raise ValueError("chat completion is missing a message")
+    return _message_text(message), _calls_from_message(message)
+
+
+def _message_text(message: dict[str, object]) -> str:
+    parts: list[str] = []
+    for key in ("reasoning_content", "content"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+    return "\n".join(parts)
+
+
+def _calls_from_message(message: dict[str, object]) -> tuple[ToolCall, ...]:
     calls: list[ToolCall] = []
-    for item in message.get("tool_calls") or []:
-        function = item["function"]
-        arguments = function["arguments"]
+    for item in message.get("tool_calls") or []:  # type: ignore[union-attr]
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        if not isinstance(function, dict):
+            continue
+        arguments = function.get("arguments", "")
         if not isinstance(arguments, str):
             arguments = json.dumps(arguments)
-        calls.append(ToolCall(str(function["name"]), arguments, str(item.get("id", ""))))
+        calls.append(ToolCall(str(function.get("name", "")), arguments, str(item.get("id", ""))))
     return tuple(calls)
+
+
+def _read_stream(lines: Iterator[str], on_text: Callable[[str], None]) -> tuple[ToolCall, ...]:
+    calls: dict[int, dict[str, str]] = {}
+    order: list[int] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if line == "[DONE]":
+            break
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            continue
+        choice = choices[0]
+        message = choice.get("message")
+        if isinstance(message, dict) and "delta" not in choice:
+            text = _message_text(message)
+            if text:
+                on_text(text)
+            return _calls_from_message(message)
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        for key in ("reasoning_content", "content"):
+            piece = delta.get(key)
+            if isinstance(piece, str) and piece:
+                on_text(piece)
+        tool_calls = delta.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for item in tool_calls:
+            if not isinstance(item, dict):
+                continue
+            index = int(item.get("index", 0))
+            slot = calls.get(index)
+            if slot is None:
+                slot = {"id": "", "name": "", "arguments": ""}
+                calls[index] = slot
+                order.append(index)
+            if item.get("id"):
+                slot["id"] = str(item["id"])
+            function = item.get("function")
+            if isinstance(function, dict):
+                if function.get("name"):
+                    slot["name"] += str(function["name"])
+                if function.get("arguments"):
+                    slot["arguments"] += str(function["arguments"])
+    return tuple(
+        ToolCall(calls[index]["name"], calls[index]["arguments"], calls[index]["id"])
+        for index in order
+    )
 
 
 def completion_body(calls: list[tuple[str, str]]) -> dict[str, object]:
