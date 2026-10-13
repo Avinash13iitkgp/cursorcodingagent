@@ -7,9 +7,11 @@ the base URL, or the model name is missing. --llm canned uses a scripted
 transport and does not read the secret. Model-backed leases last 180 seconds.
 propose_plan takes no lease and writes no file. accept_plan calls no model.
 apply_plan refuses a plan that is not accepted, writes the operator check
-commands, then runs the loop with that plan pinned in the pack. start_project
-chains those calls for one prompt and asks the caller's confirm before the
-accept, so a declined plan still writes nothing.
+commands, then runs the loop with that plan pinned in the pack and without
+list_files, search_text, or remember. start_project chains those calls for
+one prompt and asks the caller's confirm before the accept, so a declined
+plan still writes nothing. format_report prints a readable pack, not one
+JSON line.
 """
 
 from __future__ import annotations
@@ -130,7 +132,8 @@ def format_report(report: RunResult) -> str:
         report: Status, cache hit, executions, and posts from one run.
 
     Returns:
-        Status, and on a cache hit the execution and post counts.
+        Status, and on a cache hit the execution and post counts. A packed
+        prompt is one block per message, not a single JSON line.
     """
     lines = [report.status]
     if report.cache_hit:
@@ -138,7 +141,7 @@ def format_report(report: RunResult) -> str:
         lines.append(f"executions={report.executions}")
         lines.append(f"posts={report.posts}")
     if report.detail:
-        lines.append(report.detail)
+        lines.append(_readable_detail(report.detail))
     return "\n".join(lines)
 
 
@@ -153,6 +156,7 @@ def run_task(
     prompt: str | None = None,
     plan_text: str = "",
     max_steps: int = 8,
+    trace: Callable[[str], None] | None = None,
 ) -> RunResult:
     """Acquire a lease, run the loop, and release the lease.
 
@@ -168,8 +172,11 @@ def run_task(
             then 8000.
         prompt: First user message and the packed task sentence. None keeps the
             adder sentence run-task and the demos use.
-        plan_text: Accepted plan packed with the system rules, whole.
+        plan_text: Accepted plan packed with the system rules, whole. A
+            non-empty plan drops list_files, search_text, and remember.
         max_steps: Agent steps one run may reach.
+        trace: Receives one log line per model turn and tool result. None
+            stays quiet.
 
     Returns:
         The loop result. A task that is already terminal is a cache hit and
@@ -202,7 +209,15 @@ def run_task(
         lease = service.acquire(task_id, worker_id, now, _TTL)
         try:
             mcp = McpClient(data_root, Jail(), work)
-            model = _llm(data_root, tenant_id, work, llm, tool_choice, mcp.chat_tools())
+            model = _llm(
+                data_root,
+                tenant_id,
+                work,
+                llm,
+                tool_choice,
+                mcp.chat_tools(),
+                follow_plan=bool(plan_text),
+            )
             budget = (
                 int(os.environ.get("AGENT_CONTEXT_TOKEN_BUDGET", "8000"))
                 if context_token_budget is None
@@ -244,6 +259,7 @@ def run_task(
                 os.environ.get("AGENT_LLM_API_KEY", ""),
                 prompt,
                 max_steps,
+                trace,
             )
             result = loop.run(now, clock=SystemClock())
             if result.detail or not builder.last_messages:
@@ -357,6 +373,7 @@ def apply_plan(
     llm: str = "live",
     max_steps: int = 32,
     checks_cmd: tuple[str, ...] = (),
+    trace: Callable[[str], None] | None = None,
 ) -> RunResult:
     """Run the loop with the accepted plan pinned in the pack.
 
@@ -370,6 +387,8 @@ def apply_plan(
         checks_cmd: Operator commands written to {data_root}/checks/commands
             before the loop. The model does not choose them and cannot write
             that directory.
+        trace: Receives one log line per model turn and tool result. None
+            stays quiet.
 
     Returns:
         The loop result.
@@ -400,6 +419,7 @@ def apply_plan(
         prompt=apply_prompt(prompt),
         plan_text=pinned_plan(plan),
         max_steps=max_steps,
+        trace=trace,
     )
 
 
@@ -414,6 +434,7 @@ def start_project(
     max_steps: int = 32,
     checks_cmd: tuple[str, ...] = (),
     confirm: Callable[[str], bool] | None = None,
+    trace: Callable[[str], None] | None = None,
 ) -> ProjectResult:
     """Provision, plan, confirm, accept, and apply in one call.
 
@@ -431,6 +452,7 @@ def start_project(
             not choose them and cannot write that directory.
         confirm: Called with the tree before accept. None accepts without
             asking. A false answer leaves the plan proposed and writes no file.
+        trace: Receives one log line per apply turn. None stays quiet.
 
     Returns:
         The task id, the tree, whether the plan was accepted, the work root,
@@ -457,6 +479,7 @@ def start_project(
         llm=llm,
         max_steps=max_steps,
         checks_cmd=checks_cmd,
+        trace=trace,
     )
     return ProjectResult(chosen, tree, True, work_root, report)
 
@@ -525,6 +548,8 @@ def _llm(
     llm: str,
     tool_choice: str | None,
     extra_tools: list[dict[str, object]] | None = None,
+    *,
+    follow_plan: bool = False,
 ) -> OpenAIChatLlm:
     if llm == "canned":
         return OpenAIChatLlm(
@@ -533,10 +558,18 @@ def _llm(
             "canned",
             CannedTransport(_canned_bodies(work, tool_choice)),
             extra_tools=extra_tools,
+            follow_plan=follow_plan,
         )
     tenant = read_tenant(data_root, tenant_id)
     api_key, base_url, model = _live_credentials(tenant.llm_api_key_env)
-    return OpenAIChatLlm(base_url, api_key, model, UrllibTransport(), extra_tools=extra_tools)
+    return OpenAIChatLlm(
+        base_url,
+        api_key,
+        model,
+        UrllibTransport(),
+        extra_tools=extra_tools,
+        follow_plan=follow_plan,
+    )
 
 
 def _live_credentials(env_name: str) -> tuple[str, str, str]:
@@ -615,3 +648,61 @@ def _canned_bodies(work: Path, tool_choice: str | None) -> list[dict[str, object
         completion_body([("replace_text", replace)]),
         completion_body([("finish", "{}")]),
     ]
+
+
+def _readable_detail(detail: str) -> str:
+    try:
+        parsed: object = json.loads(detail)
+    except json.JSONDecodeError:
+        return detail
+    if not isinstance(parsed, list) or not parsed:
+        return detail
+    first = parsed[0]
+    if not isinstance(first, dict) or "role" not in first:
+        return detail
+    blocks: list[str] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "message"))
+        content = item.get("content", "")
+        text = content if isinstance(content, str) else json.dumps(content)
+        body = _pretty_step(text)
+        if body:
+            blocks.append(f"{role}\n{body}")
+        else:
+            blocks.append(role)
+    return "\n\n".join(blocks)
+
+
+def _pretty_step(text: str) -> str:
+    parts: list[str] = []
+    for line in text.splitlines():
+        try:
+            obj: object = json.loads(line)
+        except json.JSONDecodeError:
+            parts.append(line)
+            continue
+        shown = _pretty_obj(obj)
+        if shown:
+            parts.append(shown)
+    return "\n".join(parts)
+
+
+def _pretty_obj(obj: object) -> str:
+    if not isinstance(obj, dict):
+        return json.dumps(obj, indent=2)
+    if obj.get("text") == "" and "tool" in obj:
+        return ""
+    if "arguments" in obj and "tool" in obj:
+        args = obj["arguments"]
+        if isinstance(args, dict):
+            bits = " ".join(
+                f"{key}={value}" for key, value in args.items() if key != "content"
+            )
+            return f"{obj['tool']} {bits}".rstrip()
+    result = obj.get("result")
+    if "tool" in obj and isinstance(result, dict) and isinstance(result.get("paths"), list):
+        paths = [str(path) for path in result["paths"]]
+        return f"{obj['tool']} {len(paths)} paths\n" + "\n".join(paths)
+    return json.dumps(obj, indent=2)

@@ -380,9 +380,15 @@ def test_context_pack_shrinks_searches_and_redacts(tmp_path: Path) -> None:
         capped = json.loads(search_text(workspace, "return", "adder.py"))
         assert len(capped["hits"]) == 20
         assert search_text(workspace, "return", "missing-dir") == '{"hits": []}'
+        cache = work / "__pycache__"
+        cache.mkdir()
+        (cache / "adder.cpython-314.pyc").write_bytes(b"x")
         listed = json.loads(list_files(workspace))
         assert "adder.py" in listed["paths"]
         assert "scratch.tmp" not in listed["paths"]
+        assert not any("__pycache__" in path for path in listed["paths"])
+        listed_from_file = json.loads(list_files(workspace, "adder.py"))
+        assert listed_from_file["paths"] == listed["paths"]
         for escaped in ("../secret.txt", "/etc/passwd", ""):
             with pytest.raises(ValueError):
                 search_text(workspace, "return", escaped)

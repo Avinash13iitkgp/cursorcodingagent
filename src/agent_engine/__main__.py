@@ -4,9 +4,11 @@ This module is the process edge. It parses arguments, opens one tenant
 database, and calls LeaseService for acquire, renew, and release. jail and
 replace do not take a tenant. run-task wires the loop through composition.
 plan stores a proposed tree for a prompt, accept marks it accepted, show-plan
-prints it, and apply runs the loop only after that accept. new is those four
-in one command: it provisions the tenant, names the task after the prompt,
-prints the tree, and waits for a yes on stdin before it builds anything.
+prints it, and apply runs the loop only after that accept. apply follows the
+accepted steps and prints a readable pack, not one JSON line. new is those
+four in one command: it provisions the tenant, names the task after the
+prompt, prints the tree, and waits for a yes on stdin before it builds
+anything.
 demo starts the scenarios. The scripted self-test procedure lives in agent_engine.self_test.
 Invalid ids, tenant boundary errors, lease errors, a plan that is not
 accepted, and edit errors exit non-zero.
@@ -186,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
                 parsed.task,
                 llm=parsed.llm,
                 tool_choice=parsed.tool_choice,
+                trace=_trace_steps,
             )
             print(format_report(report))
             return 0
@@ -226,6 +229,7 @@ def _run_new(data_root: Path, tenant_id: TenantId, parsed: argparse.Namespace) -
         max_steps=parsed.max_steps,
         checks_cmd=checks,
         confirm=_plan_answer(parsed),
+        trace=_trace_steps,
     )
     print(f"task={result.task_id}")
     where = f"--data-root {data_root} --tenant {tenant_id.value} --task {result.task_id}"
@@ -248,6 +252,11 @@ def _plan_answer(parsed: argparse.Namespace):  # type: ignore[no-untyped-def]
     if parsed.yes:
         return _accept_plan
     return _ask_plan
+
+
+def _trace_steps(text: str) -> None:
+    """Print one apply or run-task step to stderr."""
+    print(text, file=sys.stderr)
 
 
 def _print_plan(tree: str) -> bool:
@@ -295,6 +304,7 @@ def _run_plan_command(
         llm=parsed.llm,
         max_steps=parsed.max_steps,
         checks_cmd=tuple(parsed.checks_cmd),
+        trace=_trace_steps,
     )
     print(format_report(report))
     return 0

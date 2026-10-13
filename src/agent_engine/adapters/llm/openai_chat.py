@@ -2,10 +2,12 @@
 
 complete POSTs {base_url}/chat/completions with Authorization: Bearer and the
 tools read_file, replace_text, write_file, run_checks, and finish. A caller
-may append tools it already discovered. plan POSTs the same endpoint with
-submit_plan as the only tool, so a planning turn cannot answer with a file
-tool. When a text listener is set and the transport can stream, the request
-sets stream and reasoning tokens are handed to that listener as they arrive.
+may append tools it already discovered. follow_plan drops list_files,
+search_text, and remember so apply executes the accepted steps. plan POSTs
+the same endpoint with submit_plan as the only tool, so a planning turn
+cannot answer with a file tool. When a text listener is set and the
+transport can stream, the request sets stream and reasoning tokens are
+handed to that listener as they arrive.
 The socket timeout is 60 seconds. The request log stores Bearer [redacted]
 and never the token. Parsing reads tool_calls off the first choice. This
 module does not choose an MCP server or its argv.
@@ -129,6 +131,10 @@ _TOOLS = [
 _LOOK_NAMES = ("list_files", "search_text", "read_file")
 _LOOK_TOOLS = [
     tool for tool in _TOOLS if tool["function"]["name"] in _LOOK_NAMES  # type: ignore[index]
+]
+_APPLY_NAMES = ("read_file", "replace_text", "write_file", "run_checks", "finish")
+_APPLY_TOOLS = [
+    tool for tool in _TOOLS if tool["function"]["name"] in _APPLY_NAMES  # type: ignore[index]
 ]
 
 _PLAN_TOOLS = [
@@ -353,6 +359,7 @@ class OpenAIChatLlm:
         extra_tools: list[dict[str, object]] | None = None,
         on_text: Callable[[str], None] | None = None,
         explore: bool = False,
+        follow_plan: bool = False,
     ) -> None:
         """Bind the client to one endpoint.
 
@@ -370,6 +377,8 @@ class OpenAIChatLlm:
             explore: When true, plan also offers list_files, search_text, and
                 read_file and does not force submit_plan. A new project leaves
                 this false.
+            follow_plan: When true, complete omits list_files, search_text,
+                and remember so apply writes the accepted tree.
         """
         self._url = base_url.rstrip("/") + "/chat/completions"
         self._api_key = api_key
@@ -379,6 +388,7 @@ class OpenAIChatLlm:
         self._extra_tools = extra_tools or []
         self._on_text = on_text
         self._explore = explore
+        self._follow_plan = follow_plan
         self._posts = 0
         self.logs: list[str] = []
         self.tool_choice: str | None = None
@@ -403,10 +413,11 @@ class OpenAIChatLlm:
         Raises:
             ValueError: The body is not a chat completion with a message.
         """
+        tools = _APPLY_TOOLS if self._follow_plan else _TOOLS
         payload: dict[str, object] = {
             "model": self._model,
             "messages": messages,
-            "tools": [*_TOOLS, *self._extra_tools] if self._extra_tools else _TOOLS,
+            "tools": [*tools, *self._extra_tools] if self._extra_tools else tools,
         }
         if self.tool_choice:
             payload["tool_choice"] = {

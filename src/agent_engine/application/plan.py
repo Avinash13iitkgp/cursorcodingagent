@@ -338,9 +338,10 @@ def apply_prompt(prompt: str) -> str:
     """
     return (
         f"{prompt}\n"
-        "Use write_file for a new path and replace_text with the hash from "
-        "read_file for a path that already exists. Call run_checks and finish "
-        "when the tree is written. Do not modify checks."
+        "Execute the accepted plan in order. Use write_file for a new path "
+        "and replace_text with the hash from read_file for a path that "
+        "already exists. Do not list or search the tree. Call run_checks and "
+        "finish when the tree is written. Do not modify checks."
     )
 
 

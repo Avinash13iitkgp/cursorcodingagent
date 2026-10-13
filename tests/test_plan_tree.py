@@ -20,7 +20,7 @@ from agent_engine.application.plan import (
     task_slug,
     validate_plan,
 )
-from agent_engine.composition import start_project
+from agent_engine.composition import apply_plan, format_report, start_project
 from agent_engine.domain.models import TenantId, ToolCall
 from step4_support import NOW, FixedChecks, ScriptedLlm, StatusGate, call, lease_task, loop
 
@@ -89,13 +89,18 @@ def test_apply_packs_the_user_sentence_and_the_planned_paths(
     assert _cli(tmp_path, "plan", "--prompt", PROMPT, "--llm", "canned") == 0
     assert _cli(tmp_path, "accept") == 0
     capsys.readouterr()
-    assert _cli(tmp_path, "apply", "--llm", "canned") == 0
-    packed = json.loads(capsys.readouterr().out.splitlines()[1])
+    report = apply_plan(tmp_path, TenantId("acme"), TASK, llm="canned")
+    packed = json.loads(report.detail)
     system = str(packed[0]["content"])
     assert PROMPT in system
     assert APP in system
     assert TEST in system
     assert "Fix adder.py" not in system
+    assert "Do not list, search, or remember" in system
+    rendered = format_report(report)
+    assert rendered.startswith("running")
+    assert "system" in rendered
+    assert not rendered.splitlines()[1].startswith("[{")
 
 
 def test_plan_refuses_a_second_proposal_after_accept(
@@ -305,6 +310,7 @@ def test_render_tree_nests_directories_before_files() -> None:
     assert f"edit {TEST}" in pinned
     assert PROMPT in apply_prompt(PROMPT)
     assert "write_file" in apply_prompt(PROMPT)
+    assert "Do not list or search the tree" in apply_prompt(PROMPT)
 
 
 def test_plan_session_offers_only_submit_plan() -> None:

@@ -7,8 +7,9 @@ When that estimate exceeds the budget, older tool results shrink to an outcome
 line: tool name, StaleContent or exit code, and the sha256. File bodies are
 not repeated. If the pack is still over, one tool-free summary call compresses
 the dropped middle into a context_summary row. The original rows stay stored.
-The prompt keeps the newest summary plus the newest steps. This builder does
-not set completed or rejected.
+The prompt keeps the newest summary plus the newest steps. An accepted plan
+swaps the explore rules for execute-the-plan rules. list_files skips cache
+directories. This builder does not set completed or rejected.
 """
 
 from __future__ import annotations
@@ -26,8 +27,16 @@ _RULES = (
     "stays on replace_text. Do not modify checks or add a compiler install. "
     "Search is not a shell."
 )
+_APPLY_RULES = (
+    "Execute the accepted plan in order. Use write_file for a new planned "
+    "path and replace_text with the hash from read_file for a path that "
+    "already exists. Do not list, search, or remember. Call run_checks and "
+    "finish when the planned files are written. Do not modify checks."
+)
 _TASK = "Fix adder.py so add(a, b) returns a + b."
 _KINDS = ("model_inference", "tool_call", "tool_result")
+_SKIP_DIRS = frozenset({".git", ".venv", "__pycache__", "node_modules"})
+_SKIP_SUFFIXES = frozenset({".tmp", ".pyc"})
 
 
 class ContextLog(Protocol):
@@ -156,7 +165,8 @@ class ContextBuilder:
         return packed
 
     def _system(self) -> str:
-        text = f"{_RULES}\n{self._task}"
+        rules = _APPLY_RULES if self._plan else _RULES
+        text = f"{rules}\n{self._task}"
         if self._plan:
             return f"{text}\n{self._plan}"
         return text
@@ -175,14 +185,16 @@ def list_files(workspace: Workspace, relative_path: str = ".") -> str:
     Args:
         workspace: Work-root port. Paths cannot leave it.
         relative_path: Directory under the work root. The default is the root.
+            A file path lists that file's directory.
 
     Returns:
-        JSON with a paths array.
+        JSON with a paths array. Cache directories, ``.tmp``, and ``.pyc``
+        files are omitted.
 
     Raises:
         ValueError: The path is absolute or leaves the work root. Nothing is written.
     """
-    paths = _files(workspace, relative_path)
+    paths = _files(workspace, _directory(workspace, relative_path))
     return json.dumps({"paths": paths})
 
 
@@ -281,6 +293,20 @@ def outcome_line(body: dict[str, object]) -> str:
     return f"{tool} ok {sha}".rstrip()
 
 
+def _directory(workspace: Workspace, relative_path: str) -> str:
+    """Return a directory path. A file path becomes its parent."""
+    _guard(relative_path)
+    root = workspace.resolve(".").resolve()
+    start = workspace.resolve(relative_path)
+    if not start.is_file():
+        return relative_path
+    try:
+        parent = start.parent.resolve().relative_to(root)
+    except ValueError as exc:
+        raise ValueError("path must stay under the work root") from exc
+    return parent.as_posix() if parent.parts else "."
+
+
 def _files(workspace: Workspace, relative_path: str) -> list[str]:
     _guard(relative_path)
     root = workspace.resolve(".").resolve()
@@ -297,7 +323,9 @@ def _files(workspace: Workspace, relative_path: str) -> list[str]:
             rel = path.resolve().relative_to(root)
         except ValueError:
             continue
-        if path.suffix == ".tmp":
+        if path.suffix in _SKIP_SUFFIXES:
+            continue
+        if any(part in _SKIP_DIRS for part in rel.parts):
             continue
         found.append(rel.as_posix())
     return sorted(found)

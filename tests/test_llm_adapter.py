@@ -118,6 +118,22 @@ def test_explore_plan_offers_search_tools_and_not_writes() -> None:
     assert json.loads(streamed.body)["stream"] is True
 
 
+def test_follow_plan_omits_explore_tools() -> None:
+    """Apply offers write tools and does not send list_files or search_text."""
+    transport = _Capture(completion_body([("write_file", json.dumps({"path": "app.py"}))]))
+    llm = OpenAIChatLlm(
+        "https://example.test/v1",
+        "token",
+        "demo-model",
+        transport,
+        follow_plan=True,
+    )
+    calls = llm.complete([{"role": "user", "content": "build the plan"}])
+    names = [item["function"]["name"] for item in json.loads(transport.body)["tools"]]
+    assert names == ["read_file", "replace_text", "write_file", "run_checks", "finish"]
+    assert calls[0].name == "write_file"
+
+
 class _Lines:
     """Yield scripted SSE lines. post is not used."""
 
