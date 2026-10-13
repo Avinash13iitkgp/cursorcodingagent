@@ -126,6 +126,15 @@ def test_over_budget_truncates_old_tool_bodies_and_keeps_the_outcome(tmp_path: P
             {"tool": "replace_text", "result": {"error": "StaleContent", "sha256": "abc"}}
         ) == "replace_text StaleContent abc"
         assert outcome_line({"tool": "read_file", "sha256": "abc"}) == "read_file ok abc"
+        assert outcome_line(
+            {
+                "tool": "read_file",
+                "result": {
+                    "sha256": "abc",
+                    "content": "except StaleContent:\n    pass\n",
+                },
+            }
+        ) == "read_file ok abc"
     finally:
         env.connection.close()
 

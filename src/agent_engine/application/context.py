@@ -267,13 +267,13 @@ def outcome_line(body: dict[str, object]) -> str:
     """
     tool = str(body.get("tool", "tool"))
     result = body.get("result")
-    blob = json.dumps(body)
     sha = ""
     if isinstance(result, dict) and result.get("sha256"):
         sha = str(result["sha256"])
     elif body.get("sha256"):
         sha = str(body["sha256"])
-    if "StaleContent" in blob:
+    stale = isinstance(result, dict) and result.get("error") == "StaleContent"
+    if stale:
         return f"{tool} StaleContent {sha}".rstrip()
     if isinstance(result, dict) and "ok" in result:
         code = 0 if result["ok"] else 1
